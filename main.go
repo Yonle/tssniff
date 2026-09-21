@@ -38,17 +38,17 @@ type DiskNode struct {
 
 	pendingMu sync.Mutex
 	pending   []PendingWrite
-	nextID    uint64
 
 	replayMu sync.Mutex
 
 	quarantine     *os.File
-	quarantinePath string
 	quarantineNext int64
+
+	hwmMu sync.Mutex
+	hwm   map[string]uint64
 }
 
 type PendingWrite struct {
-	ID          uint64
 	Offset      uint64
 	SpoolOffset int64
 	Length      int
@@ -99,6 +99,36 @@ func (d *DiskNode) Getattr(
 	out.Blksize = 512
 	out.Blocks = d.size / 512
 	return 0
+}
+
+func (d *DiskNode) reserveTSRange(
+	name string,
+	start uint64,
+	data []byte,
+) (uint64, []byte) {
+	if len(data) == 0 || name == "" {
+		return start, nil
+	}
+
+	d.hwmMu.Lock()
+	defer d.hwmMu.Unlock()
+
+	mark := d.hwm[name]
+
+	if start < mark {
+		skip := mark - start
+
+		if skip >= uint64(len(data)) {
+			return 0, nil
+		}
+
+		start += skip
+		data = data[skip:]
+	}
+
+	d.hwm[name] = start + uint64(len(data))
+
+	return start, data
 }
 
 func (d *DiskNode) Open(
@@ -179,9 +209,7 @@ func (d *DiskNode) Read(
 			continue
 		}
 
-		for i := a; i < b; i++ {
-			data[int(i-start)] = 0
-		}
+		clear(data[int(a-start):int(b-start)])
 	}
 
 	/*
@@ -209,13 +237,11 @@ func (d *DiskNode) Read(
 		)
 
 		if err != nil && !errors.Is(err, io.EOF) {
-			return fuse.ReadResultData(nil),
-				toErrno(err)
+			return fuse.ReadResultData(nil), toErrno(err)
 		}
 
 		if n != size {
-			return fuse.ReadResultData(nil),
-				syscall.EIO
+			return fuse.ReadResultData(nil), syscall.EIO
 		}
 	}
 
@@ -251,21 +277,8 @@ func (d *DiskNode) Write(
 		uint64(len(data)),
 	)
 
-	// Pre-scan: if any part of this write is unknown, this is almost
-	// certainly a read-modify-write of a file tail whose metadata has
-	// not been updated yet. The TS bytes in the buffer are OLD data
-	// that has already been broadcast, so we must not re-send them.
-	// The unknown tail is quarantined and replayed after the metadata
-	// write triggers a tracker Refresh.
-	hasUnknown := false
-	for _, seg := range segments {
-		if seg.Kind == RangeUnknown {
-			hasUnknown = true
-			break
-		}
-	}
-
 	metadataChanged := false
+	var tsBatch [][]byte
 
 	for _, seg := range segments {
 		rel := seg.Start - start
@@ -275,19 +288,33 @@ func (d *DiskNode) Write(
 
 		switch seg.Kind {
 		case RangeTS:
-			// Old TS data that the filesystem rewrote back.
-			if hasUnknown {
+			newStart, newData := d.reserveTSRange(
+				seg.Name,
+				seg.Start,
+				part,
+			)
+
+			if len(newData) == 0 {
 				continue
 			}
 
-			log.Printf(
-				"TS WRITE offset=%d size=%d file=%s",
-				seg.Start,
-				len(part),
-				seg.Name,
-			)
+			if verbLog {
+				log.Printf(
+					"TS WRITE offset=%d size=%d file=%s",
+					newStart,
+					len(newData),
+					seg.Name,
+				)
+			}
 
-			d.hub.Broadcast(part)
+			/*
+				BroadcastBatch owns the data before returning,
+				so slices into the FUSE request are safe here.
+			*/
+			tsBatch = append(
+				tsBatch,
+				newData,
+			)
 
 		case RangeNormal, RangeMeta:
 			n, err := d.fd.WriteAt(
@@ -317,6 +344,10 @@ func (d *DiskNode) Write(
 		}
 	}
 
+	if len(tsBatch) > 0 {
+		d.hub.BroadcastBatch(tsBatch)
+	}
+
 	/*
 		The filesystem metadata write may tell us that previously
 		unknown data is actually a .ts file.
@@ -324,7 +355,9 @@ func (d *DiskNode) Write(
 		Refresh AFTER writing the metadata to the backing image.
 	*/
 	if metadataChanged {
-		log.Printf("filesystem metadata changed; refreshing tracker")
+		log.Printf(
+			"filesystem metadata changed; refreshing tracker",
+		)
 
 		if err := d.tracker.Refresh(); err != nil {
 			log.Printf(
@@ -332,8 +365,10 @@ func (d *DiskNode) Write(
 				err,
 			)
 
-			// Keep the write successful. The STB must not see
-			// our internal classification failure.
+			/*
+				Keep the write successful. The STB must not see
+				our internal classification failure.
+			*/
 		} else {
 			if err := d.resolvePending(); err != nil {
 				log.Printf(
@@ -419,7 +454,7 @@ func (h *Hub) Serve(addr string) error {
 
 		c := &Client{
 			conn: conn,
-			q:    make(chan []byte, 4096),
+			q:    make(chan []byte, 256),
 		}
 
 		h.mu.Lock()
@@ -495,29 +530,31 @@ func writeFull(
 	return nil
 }
 
-func (h *Hub) Broadcast(data []byte) {
-	/*
-		FUSE owns the incoming buffer and may reuse it as soon as
-		Write returns.
+func (h *Hub) BroadcastBatch(parts [][]byte) {
+	if len(parts) == 0 {
+		return
+	}
 
-		Make one owned copy from the payload pool.
-	*/
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	for c := range h.clients {
-		payload := acquirePayload(len(data))
-		copy(payload, data)
+		dropped := false
 
-		select {
-		case c.q <- payload:
+		for _, data := range parts {
+			payload := acquirePayload(len(data))
+			copy(payload, data)
 
-		default:
-			/*
-				A slow TCP consumer must NEVER stall USB storage.
-			*/
-			releasePayload(payload)
+			select {
+			case c.q <- payload:
 
+			default:
+				releasePayload(payload)
+				dropped = true
+			}
+		}
+
+		if dropped {
 			_ = c.conn.Close()
 			close(c.q)
 			delete(h.clients, c)
@@ -533,7 +570,7 @@ func newTracker(
 	filesystem string,
 ) (Tracker, error) {
 	switch filesystem {
-	case "fat32":
+	case "fat32", "vfat":
 		return NewFAT32Tracker(
 			fd,
 			partition,
@@ -584,7 +621,12 @@ func main() {
 		"FUSE debug",
 	)
 
-	flag.BoolVar(&verbLog, "verbose", false, "Be more verbose")
+	flag.BoolVar(
+		&verbLog,
+		"verbose",
+		false,
+		"Be more verbose",
+	)
 
 	flag.Parse()
 
@@ -679,12 +721,12 @@ func main() {
 	root := &DiskFS{}
 
 	disk := &DiskNode{
-		fd:             fd,
-		size:           uint64(st.Size()),
-		tracker:        tracker,
-		hub:            hub,
-		quarantine:     quarantine,
-		quarantinePath: quarantinePath,
+		fd:         fd,
+		size:       uint64(st.Size()),
+		tracker:    tracker,
+		hub:        hub,
+		quarantine: quarantine,
+		hwm:        make(map[string]uint64),
 	}
 
 	if err := os.MkdirAll(
@@ -802,12 +844,9 @@ func (d *DiskNode) queuePending(
 		return io.ErrShortWrite
 	}
 
-	d.nextID++
-
 	d.pending = append(
 		d.pending,
 		PendingWrite{
-			ID:          d.nextID,
 			Offset:      offset,
 			SpoolOffset: spoolOffset,
 			Length:      n,
@@ -827,32 +866,23 @@ func (d *DiskNode) queuePending(
 	return nil
 }
 
-func (d *DiskNode) takePending() []PendingWrite {
-	d.pendingMu.Lock()
-	defer d.pendingMu.Unlock()
-
-	out := make(
-		[]PendingWrite,
-		len(d.pending),
-	)
-
-	copy(out, d.pending)
-
-	d.pending = d.pending[:0]
-
-	return out
-}
-
 func (d *DiskNode) pendingSnapshot() []PendingWrite {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
 
+	if len(d.pending) == 0 {
+		return nil
+	}
+
 	out := make(
 		[]PendingWrite,
 		len(d.pending),
 	)
 
-	copy(out, d.pending)
+	copy(
+		out,
+		d.pending,
+	)
 
 	return out
 }
@@ -862,34 +892,34 @@ func (d *DiskNode) resolvePending() error {
 	defer d.replayMu.Unlock()
 
 	d.pendingMu.Lock()
-	pending := make([]PendingWrite, len(d.pending))
-	copy(pending, d.pending)
+
+	pendingLen := len(d.pending)
+
+	pending := make(
+		[]PendingWrite,
+		pendingLen,
+	)
+
+	copy(
+		pending,
+		d.pending,
+	)
+
 	d.pendingMu.Unlock()
 
 	if len(pending) == 0 {
-		// Nothing in flight: drop the whole spool.
-		d.pendingMu.Lock()
-		if d.quarantineNext > 0 {
-			if err := d.quarantine.Truncate(0); err != nil {
-				log.Printf("quarantine truncate: %v", err)
-			} else {
-				d.quarantineNext = 0
-			}
-		}
-		d.pendingMu.Unlock()
 		return nil
 	}
 
-	/*
-		stillPending holds the ranges that are still
-		RangeUnknown. Their payloads are copied into
-		stillPayload first, so we can compact afterwards
-		without reading bytes we've already overwritten.
-	*/
-	stillPending := make([]PendingWrite, 0, len(pending))
-	stillPayload := make([][]byte, 0, len(pending))
+	stillPending := make(
+		[]PendingWrite,
+		0,
+		len(pending),
+	)
 
 	var buf []byte
+
+	var tsBatch [][]byte
 
 	for _, p := range pending {
 		if cap(buf) < p.Length {
@@ -898,10 +928,15 @@ func (d *DiskNode) resolvePending() error {
 			buf = buf[:p.Length]
 		}
 
-		n, err := d.quarantine.ReadAt(buf, p.SpoolOffset)
+		n, err := d.quarantine.ReadAt(
+			buf,
+			p.SpoolOffset,
+		)
+
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
+
 		if n != p.Length {
 			return io.ErrUnexpectedEOF
 		}
@@ -911,86 +946,104 @@ func (d *DiskNode) resolvePending() error {
 			uint64(p.Length),
 		)
 
+		tsBatch = tsBatch[:0]
+
 		for _, seg := range segments {
 			rel := seg.Start - p.Offset
 			length := seg.End - seg.Start
 
+			part := buf[int(rel):int(rel+length)]
+
 			switch seg.Kind {
 			case RangeTS:
-				part := buf[int(rel):int(rel+length)]
-
-				log.Printf(
-					"REPLAY TS offset=%d size=%d file=%s",
-					seg.Start, len(part), seg.Name,
+				newStart, newData := d.reserveTSRange(
+					seg.Name,
+					seg.Start,
+					part,
 				)
-				d.hub.Broadcast(part)
+
+				if len(newData) == 0 {
+					continue
+				}
+
+				if verbLog {
+					log.Printf(
+						"REPLAY TS offset=%d size=%d file=%s",
+						newStart,
+						len(newData),
+						seg.Name,
+					)
+				}
+
+				/*
+					BroadcastBatch copies the payload before returning,
+					so this slice can point directly into buf.
+				*/
+				tsBatch = append(
+					tsBatch,
+					newData,
+				)
 
 			case RangeNormal, RangeMeta:
-				part := buf[int(rel):int(rel+length)]
-
 				nn, err := d.fd.WriteAt(
 					part,
 					int64(seg.Start),
 				)
+
 				if err != nil {
 					return err
 				}
+
 				if nn != len(part) {
 					return io.ErrShortWrite
 				}
 
 			case RangeUnknown:
-				payload := make([]byte, length)
-				copy(
-					payload,
-					buf[int(rel):int(rel+length)],
-				)
-
-				stillPayload = append(
-					stillPayload,
-					payload,
-				)
 				stillPending = append(
 					stillPending,
 					PendingWrite{
-						ID:     p.ID,
 						Offset: seg.Start,
-						// SpoolOffset fixed up below.
+						SpoolOffset: p.SpoolOffset +
+							int64(rel),
 						Length: int(length),
 					},
 				)
 			}
 		}
-	}
 
-	/*
-		Compact: rewrite the quarantine file so it holds
-		only stillPayload, starting at offset 0. Old spool
-		bytes are discarded along with it.
-	*/
-	newNext := int64(0)
-
-	for i := range stillPending {
-		payload := stillPayload[i]
-
-		if _, err := d.quarantine.WriteAt(
-			payload,
-			newNext,
-		); err != nil {
-			return err
+		if len(tsBatch) > 0 {
+			d.hub.BroadcastBatch(tsBatch)
 		}
-
-		stillPending[i].SpoolOffset = newNext
-		newNext += int64(len(payload))
-	}
-
-	if err := d.quarantine.Truncate(newNext); err != nil {
-		return err
 	}
 
 	d.pendingMu.Lock()
+
+	/*
+		Preserve anything that was added while replay was running.
+		Those writes are newer than the pending snapshot we just
+		processed.
+	*/
+	if len(d.pending) > pendingLen {
+		stillPending = append(
+			stillPending,
+			d.pending[pendingLen:]...,
+		)
+	}
+
 	d.pending = stillPending
-	d.quarantineNext = newNext
+
+	/*
+		Only reset the spool when nothing remains.
+	*/
+	if len(d.pending) == 0 {
+		if err := d.quarantine.Truncate(0); err != nil {
+			d.pendingMu.Unlock()
+			return err
+		}
+
+		d.quarantineNext = 0
+	}
+
 	d.pendingMu.Unlock()
 
 	return nil

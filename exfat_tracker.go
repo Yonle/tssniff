@@ -371,6 +371,10 @@ type exfatScanState struct {
 	ranges []ByteRange
 
 	maxDepth int
+
+	fatBuf  [512]byte
+	fatBase uint64
+	fatSet  bool
 }
 
 func (s *exfatScanState) clusterOffset(
@@ -407,19 +411,19 @@ func (s *exfatScanState) fatOffset(
 		uint64(cluster)*4
 }
 
-func (s *exfatScanState) nextCluster(
-	cluster uint32,
-) (uint32, error) {
-	var b [4]byte
+func (s *exfatScanState) nextCluster(cluster uint32) (uint32, error) {
+	off := s.fatOffset(cluster)
+	base := off &^ 511
 
-	if _, err := s.fd.ReadAt(
-		b[:],
-		int64(s.fatOffset(cluster)),
-	); err != nil {
-		return 0, err
+	if !s.fatSet || s.fatBase != base {
+		if _, err := s.fd.ReadAt(s.fatBuf[:], int64(base)); err != nil {
+			return 0, err
+		}
+		s.fatBase, s.fatSet = base, true
 	}
 
-	return binary.LittleEndian.Uint32(b[:]), nil
+	i := off - base
+	return binary.LittleEndian.Uint32(s.fatBuf[i:i+4]) & 0x0FFFFFFF, nil
 }
 
 func isExfatEOC(c uint32) bool {
