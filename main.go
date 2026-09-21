@@ -40,6 +40,8 @@ type DiskNode struct {
 	pending   []PendingWrite
 	nextID    uint64
 
+	replayMu sync.Mutex
+
 	quarantine     *os.File
 	quarantinePath string
 	quarantineNext int64
@@ -60,6 +62,10 @@ var (
 	_ fs.NodeWriter    = (*DiskNode)(nil)
 	_ fs.NodeFlusher   = (*DiskNode)(nil)
 	_ fs.NodeFsyncer   = (*DiskNode)(nil)
+)
+
+var (
+	verbLog bool
 )
 
 func (r *DiskFS) Getattr(
@@ -578,6 +584,8 @@ func main() {
 		"FUSE debug",
 	)
 
+	flag.BoolVar(&verbLog, "verbose", false, "Be more verbose")
+
 	flag.Parse()
 
 	st, err := os.Stat(*image)
@@ -609,7 +617,10 @@ func main() {
 	}
 	defer fd.Close()
 
-	quarantinePath := *image + ".quarantine"
+	quarantinePath := filepath.Join(
+		"/dev/shm",
+		filepath.Base(*image)+".quarantine",
+	)
 
 	quarantine, err := os.OpenFile(
 		quarantinePath,
@@ -623,6 +634,7 @@ func main() {
 		)
 	}
 	defer quarantine.Close()
+	defer os.Remove(quarantinePath)
 
 	hub := NewHub()
 
@@ -804,11 +816,13 @@ func (d *DiskNode) queuePending(
 
 	d.quarantineNext += int64(n)
 
-	log.Printf(
-		"QUARANTINE offset=%d size=%d",
-		offset,
-		n,
-	)
+	if verbLog {
+		log.Printf(
+			"QUARANTINE offset=%d size=%d",
+			offset,
+			n,
+		)
+	}
 
 	return nil
 }
@@ -844,13 +858,36 @@ func (d *DiskNode) pendingSnapshot() []PendingWrite {
 }
 
 func (d *DiskNode) resolvePending() error {
-	pending := d.takePending()
+	d.replayMu.Lock()
+	defer d.replayMu.Unlock()
+
+	d.pendingMu.Lock()
+	pending := make([]PendingWrite, len(d.pending))
+	copy(pending, d.pending)
+	d.pendingMu.Unlock()
 
 	if len(pending) == 0 {
+		// Nothing in flight: drop the whole spool.
+		d.pendingMu.Lock()
+		if d.quarantineNext > 0 {
+			if err := d.quarantine.Truncate(0); err != nil {
+				log.Printf("quarantine truncate: %v", err)
+			} else {
+				d.quarantineNext = 0
+			}
+		}
+		d.pendingMu.Unlock()
 		return nil
 	}
 
-	seen := make(map[[2]uint64]struct{}, len(pending))
+	/*
+		stillPending holds the ranges that are still
+		RangeUnknown. Their payloads are copied into
+		stillPayload first, so we can compact afterwards
+		without reading bytes we've already overwritten.
+	*/
+	stillPending := make([]PendingWrite, 0, len(pending))
+	stillPayload := make([][]byte, 0, len(pending))
 
 	var buf []byte
 
@@ -861,15 +898,10 @@ func (d *DiskNode) resolvePending() error {
 			buf = buf[:p.Length]
 		}
 
-		n, err := d.quarantine.ReadAt(
-			buf,
-			p.SpoolOffset,
-		)
-
+		n, err := d.quarantine.ReadAt(buf, p.SpoolOffset)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
-
 		if n != p.Length {
 			return io.ErrUnexpectedEOF
 		}
@@ -883,49 +915,83 @@ func (d *DiskNode) resolvePending() error {
 			rel := seg.Start - p.Offset
 			length := seg.End - seg.Start
 
-			part := buf[int(rel):int(rel+length)]
-
 			switch seg.Kind {
 			case RangeTS:
+				part := buf[int(rel):int(rel+length)]
+
 				log.Printf(
 					"REPLAY TS offset=%d size=%d file=%s",
-					seg.Start,
-					len(part),
-					seg.Name,
+					seg.Start, len(part), seg.Name,
 				)
-
 				d.hub.Broadcast(part)
 
 			case RangeNormal, RangeMeta:
-				n, err := d.fd.WriteAt(
+				part := buf[int(rel):int(rel+length)]
+
+				nn, err := d.fd.WriteAt(
 					part,
 					int64(seg.Start),
 				)
-
 				if err != nil {
 					return err
 				}
-
-				if n != len(part) {
+				if nn != len(part) {
 					return io.ErrShortWrite
 				}
 
 			case RangeUnknown:
-				key := [2]uint64{seg.Start, seg.End - seg.Start}
-				if _, dup := seen[key]; dup {
-					continue
-				}
-				seen[key] = struct{}{}
+				payload := make([]byte, length)
+				copy(
+					payload,
+					buf[int(rel):int(rel+length)],
+				)
 
-				if err := d.queuePending(
-					seg.Start,
-					part,
-				); err != nil {
-					return err
-				}
+				stillPayload = append(
+					stillPayload,
+					payload,
+				)
+				stillPending = append(
+					stillPending,
+					PendingWrite{
+						ID:     p.ID,
+						Offset: seg.Start,
+						// SpoolOffset fixed up below.
+						Length: int(length),
+					},
+				)
 			}
 		}
 	}
+
+	/*
+		Compact: rewrite the quarantine file so it holds
+		only stillPayload, starting at offset 0. Old spool
+		bytes are discarded along with it.
+	*/
+	newNext := int64(0)
+
+	for i := range stillPending {
+		payload := stillPayload[i]
+
+		if _, err := d.quarantine.WriteAt(
+			payload,
+			newNext,
+		); err != nil {
+			return err
+		}
+
+		stillPending[i].SpoolOffset = newNext
+		newNext += int64(len(payload))
+	}
+
+	if err := d.quarantine.Truncate(newNext); err != nil {
+		return err
+	}
+
+	d.pendingMu.Lock()
+	d.pending = stillPending
+	d.quarantineNext = newNext
+	d.pendingMu.Unlock()
 
 	return nil
 }
