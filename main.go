@@ -44,12 +44,17 @@ type DiskNode struct {
 	pendingMu sync.Mutex
 	pending   []PendingWrite
 	nextID    uint64
+
+	quarantine     *os.File
+	quarantinePath string
+	quarantineNext int64
 }
 
 type PendingWrite struct {
-	ID     uint64
-	Offset uint64
-	Data   []byte
+	ID          uint64
+	Offset      uint64
+	SpoolOffset int64
+	Length      int
 }
 
 var (
@@ -186,7 +191,7 @@ func (d *DiskNode) Read(
 		a := maxU64(start, p.Offset)
 		b := minU64(
 			start+length,
-			p.Offset+uint64(len(p.Data)),
+			p.Offset+uint64(p.Length),
 		)
 
 		if a >= b {
@@ -195,11 +200,22 @@ func (d *DiskNode) Read(
 
 		srcStart := a - p.Offset
 		dstStart := a - start
+		size := int(b - a)
 
-		copy(
-			data[int(dstStart):int(dstStart+(b-a))],
-			p.Data[int(srcStart):int(srcStart+(b-a))],
+		n, err := d.quarantine.ReadAt(
+			data[int(dstStart):int(dstStart)+size],
+			p.SpoolOffset+int64(srcStart),
 		)
+
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fuse.ReadResultData(nil),
+				toErrno(err)
+		}
+
+		if n != size {
+			return fuse.ReadResultData(nil),
+				syscall.EIO
+		}
 	}
 
 	return fuse.ReadResultData(data), 0
@@ -274,10 +290,12 @@ func (d *DiskNode) Write(
 			}
 
 		case RangeUnknown:
-			d.queuePending(
+			if err := d.queuePending(
 				seg.Start,
 				part,
-			)
+			); err != nil {
+				return 0, toErrno(err)
+			}
 		}
 	}
 
@@ -532,6 +550,18 @@ func main() {
 	}
 	defer fd.Close()
 
+	quarantinePath := *image + ".quarantine"
+
+	quarantine, err := os.OpenFile(
+		quarantinePath,
+		os.O_RDWR|os.O_CREATE|os.O_TRUNC,
+		0600,
+	)
+	if err != nil {
+		log.Fatal("open quarantine file: ", err)
+	}
+	defer quarantine.Close()
+
 	hub := NewHub()
 
 	partition, err := findExFATPartition(fd)
@@ -557,10 +587,12 @@ func main() {
 	root := &DiskFS{}
 
 	disk := &DiskNode{
-		fd:      fd,
-		size:    uint64(st.Size()),
-		tracker: tracker,
-		hub:     hub,
+		fd:             fd,
+		size:           uint64(st.Size()),
+		tracker:        tracker,
+		hub:            hub,
+		quarantine:     quarantine,
+		quarantinePath: quarantinePath,
 	}
 
 	if err := os.MkdirAll(
@@ -643,32 +675,53 @@ func main() {
 func (d *DiskNode) queuePending(
 	offset uint64,
 	data []byte,
-) {
+) error {
 	if len(data) == 0 {
-		return
+		return nil
 	}
-
-	copyData := append([]byte(nil), data...)
 
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
+
+	if d.quarantine == nil {
+		return errors.New("quarantine file is not open")
+	}
+
+	spoolOffset := d.quarantineNext
+
+	n, err := d.quarantine.WriteAt(
+		data,
+		spoolOffset,
+	)
+	if err != nil {
+		return err
+	}
+
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
 
 	d.nextID++
 
 	d.pending = append(
 		d.pending,
 		PendingWrite{
-			ID:     d.nextID,
-			Offset: offset,
-			Data:   copyData,
+			ID:          d.nextID,
+			Offset:      offset,
+			SpoolOffset: spoolOffset,
+			Length:      n,
 		},
 	)
+
+	d.quarantineNext += int64(n)
 
 	log.Printf(
 		"QUARANTINE offset=%d size=%d",
 		offset,
-		len(copyData),
+		n,
 	)
+
+	return nil
 }
 
 func (d *DiskNode) takePending() []PendingWrite {
@@ -704,17 +757,42 @@ func (d *DiskNode) pendingSnapshot() []PendingWrite {
 func (d *DiskNode) resolvePending() error {
 	pending := d.takePending()
 
+	if len(pending) == 0 {
+		return nil
+	}
+
+	var buf []byte
+
 	for _, p := range pending {
+		if cap(buf) < p.Length {
+			buf = make([]byte, p.Length)
+		} else {
+			buf = buf[:p.Length]
+		}
+
+		n, err := d.quarantine.ReadAt(
+			buf,
+			p.SpoolOffset,
+		)
+
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+
+		if n != p.Length {
+			return io.ErrUnexpectedEOF
+		}
+
 		segments := d.tracker.Classify(
 			p.Offset,
-			uint64(len(p.Data)),
+			uint64(p.Length),
 		)
 
 		for _, seg := range segments {
 			rel := seg.Start - p.Offset
 			length := seg.End - seg.Start
 
-			part := p.Data[rel : rel+length]
+			part := buf[int(rel):int(rel+length)]
 
 			switch seg.Kind {
 			case RangeTS:
@@ -742,11 +820,12 @@ func (d *DiskNode) resolvePending() error {
 				}
 
 			case RangeUnknown:
-				// Still don't know what this is.
-				d.queuePending(
+				if err := d.queuePending(
 					seg.Start,
 					part,
-				)
+				); err != nil {
+					return err
+				}
 			}
 		}
 	}
