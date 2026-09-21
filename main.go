@@ -379,7 +379,7 @@ func (h *Hub) Serve(addr string) error {
 
 		c := &Client{
 			conn: conn,
-			q:    make(chan []byte, 64),
+			q:    make(chan []byte, 4096),
 		}
 
 		h.mu.Lock()
@@ -395,6 +395,14 @@ func (h *Hub) Serve(addr string) error {
 
 		go func() {
 			defer func() {
+				/*
+					Anything still queued belongs to this client and is
+					no longer going to be written.
+				*/
+				for payload := range c.q {
+					releasePayload(payload)
+				}
+
 				_ = conn.Close()
 
 				h.mu.Lock()
@@ -410,7 +418,11 @@ func (h *Hub) Serve(addr string) error {
 			}()
 
 			for payload := range c.q {
-				if err := writeFull(conn, payload); err != nil {
+				err := writeFull(conn, payload)
+
+				releasePayload(payload)
+
+				if err != nil {
 					return
 				}
 			}
@@ -419,14 +431,19 @@ func (h *Hub) Serve(addr string) error {
 }
 
 func writeFull(w net.Conn, p []byte) error {
-	for len(p) > 0 {
-		n, err := w.Write(p)
+	offset := 0
 
+	for offset < len(p) {
+		n, err := w.Write(p[offset:])
 		if err != nil {
 			return err
 		}
 
-		p = p[n:]
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+
+		offset += n
 	}
 
 	return nil
@@ -434,17 +451,19 @@ func writeFull(w net.Conn, p []byte) error {
 
 func (h *Hub) Broadcast(data []byte) {
 	/*
-			FUSE owns the incoming buffer and may reuse it as soon as
-			Write returns.
+		FUSE owns the incoming buffer and may reuse it as soon as
+		Write returns.
 
-		Make one immutable copy for the TCP side.
+		Make one owned copy from the payload pool.
 	*/
-	payload := append([]byte(nil), data...)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	for c := range h.clients {
+		payload := acquirePayload(len(data))
+		copy(payload, data)
+
 		select {
 		case c.q <- payload:
 
@@ -452,6 +471,8 @@ func (h *Hub) Broadcast(data []byte) {
 			/*
 				A slow TCP consumer must NEVER stall USB storage.
 			*/
+			releasePayload(payload)
+
 			_ = c.conn.Close()
 			close(c.q)
 			delete(h.clients, c)
