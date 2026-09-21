@@ -962,7 +962,7 @@ func (s *fat32ScanState) parseDirectoryClusters(
 			*/
 			clusters, err := s.fatChain(
 				firstCluster,
-				s.layout.clusterCount,
+				(dataLength+s.layout.clusterSize-1)/s.layout.clusterSize,
 			)
 			if err != nil {
 				return fmt.Errorf(
@@ -972,9 +972,10 @@ func (s *fat32ScanState) parseDirectoryClusters(
 				)
 			}
 
-			ranges := clustersToFAT32FullRanges(
+			ranges := clustersToFAT32FileRanges(
 				clusters,
 				s.layout.clusterSize,
+				dataLength,
 				s,
 			)
 

@@ -824,9 +824,10 @@ func (s *exfatScanState) parseDirectoryBytes(
 			}
 
 			ranges :=
-				clustersToExfatFullRanges(
+				clustersToExfatFileRanges(
 					clusters,
 					s.layout.clusterSize,
+					dataLength,
 					s,
 				)
 
