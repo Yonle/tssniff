@@ -634,6 +634,8 @@ select_udc() {
 
 prepare_gadget() {
     need_root
+
+    modprobe libcomposite
     ensure_configfs
 
     [[ -e "$GADGET_IMAGE" ]] ||
