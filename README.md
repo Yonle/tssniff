@@ -1,8 +1,8 @@
 # tssniff
 
-`tssniff` is a Linux userspace utility that exposes a virtual filesystem through FUSE and monitors writes to MPEG-TS (`.ts`) files.
+`tssniff` is a Linux userspace utility that **fakes being a USB storage medium** using FUSE and a USB Mass Storage gadget.
 
-It is intended for use behind a USB Mass Storage gadget, where a host device sees a normal storage medium while selected TS file writes can be intercepted and forwarded over TCP.
+It presents a normal disk to the connected host while monitoring filesystem writes and intercepting MPEG-TS (`.ts`) file data.
 
 ## Architecture
 
@@ -11,22 +11,22 @@ Host / STB
     │
     │ USB Mass Storage
     ▼
-FUSE filesystem
+  Fake disk
     │
     ▼
-tssniff
- ┌──┴────────────────┐
- │                   │
- │ normal files      │ *.ts writes
- │                   │
- ▼                   ▼
-storage          interception
-                     │
-                     ▼
+  tssniff
+ ┌──┴──────────────┐
+ │                 │
+normal writes    *.ts writes
+ │                 │
+ ▼                 ▼
+storage        interception
+                    │
+                    ▼
                  TCP :6969
 ```
 
-The backing storage is an image file. `tssniff` creates and mounts a FUSE-visible disk image which can then be used as the backing file for a USB Mass Storage gadget.
+The fake disk is a complete disk image containing an MBR partition table and an exFAT partition.
 
 ## Usage
 
@@ -41,87 +41,126 @@ Options:
 
 | Option    | Description           |
 | --------- | --------------------- |
-| `-image`  | Backing storage image |
+| `-image`  | Backing disk image    |
 | `-mount`  | FUSE mount point      |
 | `-listen` | TCP listen address    |
+| `-debug`  | Enable FUSE debugging |
 
-For example:
+## Disk layout
 
-```sh
-ffmpeg -re -i input.ts \
-    -c copy \
-    -f mpegts \
-    /mnt/tsdisk/test.ts
+```text
++---------------------------+
+| MBR                       |
++---------------------------+
+| alignment                 |
++---------------------------+
+| Partition 1               |
+| exFAT                     |
++---------------------------+
 ```
 
-A TCP client can connect to:
+`tssniff` reads the MBR to locate the exFAT partition.
 
-```sh
-nc 192.168.50.1 6969
-```
+Partition detection is separated from filesystem handling so additional partition-table formats can be implemented later.
 
-## Storage
+## Storage handling
 
-The backing image is not directly exported to the USB host.
+The backing image is not directly exposed to the host.
 
 Instead:
 
 ```text
-backing image
-     │
-     ▼
-  tssniff
-     │
-     ▼
-FUSE filesystem
-     │
-     ▼
-gadget Mass Storage LUN
+backing disk image
+        │
+        ▼
+     tssniff
+        │
+        ▼
+   FUSE disk.img
 ```
 
-This allows filesystem operations to be observed and handled before reaching the backing storage.
+The complete disk image, including the MBR and partition table, is exposed through the FUSE filesystem.
+
+This allows filesystem writes to be inspected before they reach the backing image.
 
 ## TS interception
 
-Writes targeting `.ts` files are tracked by `tssniff`. Newly written ranges can be quarantined and replayed through the interception path.
+`tssniff` tracks the exFAT filesystem and associates file data ranges with filenames.
 
-The TCP output carries the intercepted MPEG-TS data as a byte stream. Transport framing is intentionally minimal; applications consuming the stream are expected to handle MPEG-TS accordingly.
+Writes to `.ts` files are intercepted and forwarded to connected TCP clients.
 
-## Requirements
+Writes whose purpose cannot yet be determined may be temporarily quarantined. Filesystem metadata changes trigger a rescan, allowing newly-created files to be identified and their pending writes replayed through the appropriate path.
+
+A slow TCP client is disconnected rather than blocking storage I/O.
+
+## `gadget.sh`
+
+`gadget.sh` prepares the fake disk and configures the USB Mass Storage gadget.
+
+Commands:
+
+```text
+prepare-fakedisk
+prepare-tssniff
+stop-tssniff
+mount
+unmount
+prepare-gadget
+find-udc
+start
+stop
+status
+```
+
+Typical usage:
+
+```sh
+sudo ./gadget.sh start
+```
+
+Check status:
+
+```sh
+sudo ./gadget.sh status
+```
+
+Stop:
+
+```sh
+sudo ./gadget.sh stop
+```
+
+For testing the exported filesystem without USB gadget mode:
+
+```sh
+sudo ./gadget.sh mount
+```
+
+and:
+
+```sh
+sudo ./gadget.sh unmount
+```
+
+## USB gadget requirements
+
+USB gadget deployment requires:
 
 * Linux
 * FUSE
-* A filesystem image suitable for the exported storage
-* TCP networking
-
-For USB gadget deployment, the Linux system additionally requires:
-
 * ConfigFS
 * `libcomposite`
-* A USB Device Controller (UDC)
 * Mass Storage Gadget support
+* A USB Device Controller (UDC)
 
-A normal USB host controller is not sufficient for gadget mode.
-
-## Intended deployment
-
-A typical deployment can use:
+The configured gadget exposes only a Mass Storage function:
 
 ```text
-USB Gadget
-    │
-    │ Mass Storage only
-    ▼
-STB
-
-Linux device
- ├── hostapd
- ├── tssniff :6969
- └── ConfigFS USB Mass Storage Gadget
+USB Mass Storage
+└── LUN 0
+    └── fake disk image
 ```
-
-The Wi-Fi network provides access to the TCP stream while the USB interface presents only a Mass Storage device to the STB.
 
 ## Status
 
-`tssniff` is experimental software intended for Linux-based storage interception and USB-gadget applications.
+`tssniff` is experimental software for faking USB storage media and intercepting MPEG-TS file writes on Linux.
