@@ -29,16 +29,21 @@ type ByteRange struct {
 }
 
 type ExfatTracker struct {
-	fd *os.File
+	fd              *os.File
+	partitionOffset int64
 
 	mu    sync.RWMutex
 	meta  []ByteRange
 	rules []ByteRange
 }
 
-func NewExfatTracker(fd *os.File) *ExfatTracker {
+func NewExfatTracker(
+	fd *os.File,
+	partitionOffset int64,
+) *ExfatTracker {
 	return &ExfatTracker{
-		fd: fd,
+		fd:              fd,
+		partitionOffset: partitionOffset,
 	}
 }
 
@@ -160,15 +165,15 @@ func (t *ExfatTracker) OverlapsMetadata(
 }
 
 func (t *ExfatTracker) Refresh() error {
-	layout, err := readLayout(t.fd)
+	layout, err := readLayout(t.fd, t.partitionOffset)
 	if err != nil {
 		return err
 	}
 
 	state := &scanState{
-		fd:       t.fd,
-		layout:   layout,
-		visited:  make(map[uint32]bool),
+		fd:      t.fd,
+		layout:  layout,
+		visited: make(map[uint32]bool),
 
 		/*
 			Everything before the cluster heap contains filesystem
@@ -177,8 +182,8 @@ func (t *ExfatTracker) Refresh() error {
 		*/
 		meta: []ByteRange{
 			{
-				Start: 0,
-				End:   layout.clusterHeapOffsetBytes,
+				Start: uint64(t.partitionOffset),
+				End:   uint64(t.partitionOffset) + layout.clusterHeapOffsetBytes,
 				Kind:  RangeMeta,
 				Name:  "boot+FAT",
 			},
@@ -211,7 +216,7 @@ func (t *ExfatTracker) Refresh() error {
 	t.meta = coalesceRanges(state.meta)
 	t.rules = coalesceRanges(state.ranges)
 	t.mu.Unlock()
-
+	/*
 	fmt.Printf(
 		"exFAT: %d TS ranges\n",
 		len(state.ranges),
@@ -225,13 +230,14 @@ func (t *ExfatTracker) Refresh() error {
 			r.End,
 			r.End-r.Start,
 		)
-	}
+	}*/
 
 	return nil
 }
 
 type exfatLayout struct {
-	sectorSize uint64
+	partitionOffset uint64
+	sectorSize      uint64
 
 	sectorsPerCluster uint64
 	clusterSize       uint64
@@ -252,12 +258,21 @@ type exfatLayout struct {
 
 func readLayout(
 	fd *os.File,
+	partitionOffset int64,
 ) (exfatLayout, error) {
+	if partitionOffset < 0 {
+		return exfatLayout{},
+			fmt.Errorf(
+				"negative partition offset %d",
+				partitionOffset,
+			)
+	}
+
 	boot := make([]byte, 512)
 
 	if _, err := fd.ReadAt(
 		boot,
-		0,
+		partitionOffset,
 	); err != nil {
 		return exfatLayout{}, err
 	}
@@ -338,7 +353,8 @@ func readLayout(
 	}
 
 	return exfatLayout{
-		sectorSize: sectorSize,
+		partitionOffset: uint64(partitionOffset),
+		sectorSize:      sectorSize,
 
 		sectorsPerCluster: sectorsPerCluster,
 		clusterSize:       clusterSize,
@@ -387,7 +403,7 @@ func (s *scanState) clusterOffset(
 			(uint64(cluster)-2)*
 				s.layout.sectorsPerCluster
 
-	return sector * s.layout.sectorSize, nil
+	return s.layout.partitionOffset + sector*s.layout.sectorSize, nil
 }
 
 func (s *scanState) fatOffset(
@@ -398,8 +414,8 @@ func (s *scanState) fatOffset(
 			uint64(s.layout.activeFAT)*
 				s.layout.fatLength
 
-	return baseSector*
-		s.layout.sectorSize +
+	return s.layout.partitionOffset +
+		baseSector*s.layout.sectorSize +
 		uint64(cluster)*4
 }
 
@@ -711,7 +727,7 @@ func (s *scanState) parseDirectoryBytes(
 
 		case 0x85:
 			// Normal file/directory entry.
-			
+
 		default:
 			continue
 		}
@@ -740,7 +756,7 @@ func (s *scanState) parseDirectoryBytes(
 			make([]uint16, 0, 255)
 
 		for j := 0; j < secondaryCount; j++ {
-			secondary := buf[i+32*(j+1):i+32*(j+2)]
+			secondary := buf[i+32*(j+1) : i+32*(j+2)]
 
 			switch secondary[0] {
 			case 0xC0:
@@ -953,4 +969,8 @@ func coalesceRanges(
 	}
 
 	return out
+}
+
+func findExFATPartition(f *os.File) (Partition, error) {
+	return findMBRExFATPartition(f)
 }

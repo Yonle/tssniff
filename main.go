@@ -21,6 +21,12 @@ type DiskFS struct {
 	fs.Inode
 }
 
+type Partition struct {
+	Offset int64
+	Size   int64
+	Type   byte
+}
+
 var (
 	_ fs.InodeEmbedder = (*DiskFS)(nil)
 	_ fs.NodeGetattrer = (*DiskFS)(nil)
@@ -49,11 +55,11 @@ type PendingWrite struct {
 var (
 	_ fs.InodeEmbedder = (*DiskNode)(nil)
 	_ fs.NodeGetattrer = (*DiskNode)(nil)
-	_ fs.NodeOpener = (*DiskNode)(nil)
-	_ fs.NodeReader = (*DiskNode)(nil)
-	_ fs.NodeWriter = (*DiskNode)(nil)
-	_ fs.NodeFlusher = (*DiskNode)(nil)
-	_ fs.NodeFsyncer = (*DiskNode)(nil)
+	_ fs.NodeOpener    = (*DiskNode)(nil)
+	_ fs.NodeReader    = (*DiskNode)(nil)
+	_ fs.NodeWriter    = (*DiskNode)(nil)
+	_ fs.NodeFlusher   = (*DiskNode)(nil)
+	_ fs.NodeFsyncer   = (*DiskNode)(nil)
 )
 
 func (r *DiskFS) Getattr(
@@ -234,7 +240,7 @@ func (d *DiskNode) Write(
 		rel := seg.Start - start
 		length := seg.End - seg.Start
 
-		part := data[rel:rel+length]
+		part := data[rel : rel+length]
 
 		switch seg.Kind {
 		case RangeTS:
@@ -282,6 +288,7 @@ func (d *DiskNode) Write(
 		Refresh AFTER writing the metadata to the backing image.
 	*/
 	if metadataChanged {
+		log.Printf("exFAT metadata changed; refreshing tracker")
 		if err := d.tracker.Refresh(); err != nil {
 			log.Printf(
 				"exFAT refresh: %v",
@@ -427,10 +434,10 @@ func writeFull(w net.Conn, p []byte) error {
 
 func (h *Hub) Broadcast(data []byte) {
 	/*
-		FUSE owns the incoming buffer and may reuse it as soon as
-		Write returns.
+			FUSE owns the incoming buffer and may reuse it as soon as
+			Write returns.
 
-	Make one immutable copy for the TCP side.
+		Make one immutable copy for the TCP side.
 	*/
 	payload := append([]byte(nil), data...)
 
@@ -506,13 +513,24 @@ func main() {
 
 	hub := NewHub()
 
-	tracker := NewExfatTracker(fd)
+	partition, err := findExFATPartition(fd)
+	if err != nil {
+		log.Fatal("find exFAT partition: ", err)
+	}
+
+	log.Printf(
+		"exFAT partition: offset=%d size=%d\n",
+		partition.Offset,
+		partition.Size,
+	)
+
+	tracker := NewExfatTracker(
+		fd,
+		partition.Offset,
+	)
 
 	if err := tracker.Refresh(); err != nil {
-		log.Fatalf(
-			"initial exFAT scan failed: %v",
-			err,
-		)
+		log.Fatal("initial exFAT scan: ", err)
 	}
 
 	root := &DiskFS{}

@@ -74,6 +74,14 @@ TSSNIFF_START_TIMEOUT="${TSSNIFF_START_TIMEOUT:-15}"
 ###############################################################################
 
 DISK_SIZE="${DISK_SIZE:-1T}"
+SECTOR_SIZE="${SECTOR_SIZE:-512}"
+
+PARTITION_START_LBA="${PARTITION_START_LBA:-2048}"
+PARTITION_TYPE="${PARTITION_TYPE:-7}"
+
+PARTITION_OFFSET="$(
+    echo $((PARTITION_START_LBA * SECTOR_SIZE))
+)"
 
 ###############################################################################
 # USB gadget
@@ -151,21 +159,145 @@ ensure_configfs() {
 # Fake disk
 ###############################################################################
 
-is_exfat_image() {
+is_partitioned_exfat_image() {
     [[ -f "$1" ]] || return 1
 
-    local magic
+    ###########################################################################
+    # Must be an MBR disk.
+    ###########################################################################
 
-    magic="$(
-        dd if="$1" \
-            bs=1 \
-            skip=3 \
-            count=8 \
-            status=none \
+    if ! sfdisk --dump "$1" 2>/dev/null |
+        grep -q '^label: dos$'
+    then
+        return 1
+    fi
+
+    ###########################################################################
+    # Ask the kernel to expose the MBR partitions.
+    ###########################################################################
+
+    local loop
+    local type
+
+    loop="$(
+        losetup \
+            --find \
+            --show \
+            --partscan \
+            "$1"
+    )" || return 1
+
+    if [[ ! -b "${loop}p1" ]]; then
+        losetup -d "$loop" 2>/dev/null || true
+        return 1
+    fi
+
+    type="$(
+        blkid \
+            -s TYPE \
+            -o value \
+            "${loop}p1" \
             2>/dev/null || true
     )"
 
-    [[ "$magic" == "EXFAT   " ]]
+    losetup -d "$loop" 2>/dev/null || true
+
+    [[ "$type" == "exfat" ]]
+}
+
+create_partitioned_exfat_image() {
+    local image="$1"
+
+    local size
+    local sectors
+    local partition_sectors
+
+    size="$(stat -c '%s' "$image")"
+
+    if (( $size % $SECTOR_SIZE != 0 )); then
+        die \
+            "image size is not sector-aligned: $size bytes"
+    fi
+
+    sectors=$(($size / $SECTOR_SIZE))
+
+    if (( $sectors <= $PARTITION_START_LBA )); then
+        die \
+            "disk is too small for partition starting at LBA $PARTITION_START_LBA"
+    fi
+
+    partition_sectors=$(($sectors - $PARTITION_START_LBA))
+
+    info "creating MBR partition table"
+
+    sfdisk \
+        "$image" <<EOF
+label: dos
+unit: sectors
+
+start=$PARTITION_START_LBA, size=$partition_sectors, type=$PARTITION_TYPE
+EOF
+
+    ###########################################################################
+    # Attach the image and let Linux expose partition 1.
+    ###########################################################################
+
+    local loop
+
+    loop="$(
+        losetup \
+            --find \
+            --show \
+            --partscan \
+            "$image"
+    )"
+
+    echo "  loop:   $loop"
+    echo "  start:  LBA $PARTITION_START_LBA"
+    echo "  offset: $PARTITION_OFFSET bytes"
+
+    ###########################################################################
+    # Wait briefly for loopXp1 to appear.
+    ###########################################################################
+
+    for _ in {1..20}; do
+        if [[ -b "${loop}p1" ]]; then
+            break
+        fi
+
+        sleep 0.1
+    done
+
+    if [[ ! -b "${loop}p1" ]]; then
+        losetup -d "$loop" 2>/dev/null || true
+
+        die \
+            "partition device did not appear: ${loop}p1"
+    fi
+
+    info "formatting partition 1 as exFAT"
+
+    if ! mkfs.exfat \
+        -n GUOXIN \
+        "${loop}p1"
+    then
+        losetup -d "$loop" 2>/dev/null || true
+
+        die \
+            "failed to format ${loop}p1 as exFAT"
+    fi
+
+    losetup -d "$loop"
+
+    echo
+    echo "partitioned fake disk prepared:"
+    echo "  image:      $image"
+    echo "  size:       $(stat -c '%s bytes' "$image")"
+    echo "  partition:  1"
+    echo "  type:       MBR 0x07"
+    echo "  start LBA:  $PARTITION_START_LBA"
+    echo "  offset:     $PARTITION_OFFSET bytes"
+    echo "  filesystem: exFAT"
 }
 
 prepare_fakedisk() {
@@ -184,15 +316,7 @@ prepare_fakedisk() {
             -s "$DISK_SIZE" \
             "$BACKING_IMAGE"
 
-        info "formatting as exFAT"
-
-        mkfs.exfat \
-            "$BACKING_IMAGE"
-
-        echo
-        echo "fake disk prepared:"
-        echo "  image: $BACKING_IMAGE"
-        echo "  size:  $(stat -c '%s bytes' "$BACKING_IMAGE")"
+        create_partitioned_exfat_image "$BACKING_IMAGE"
 
         return
     fi
@@ -202,18 +326,21 @@ prepare_fakedisk() {
             "backing image exists but is not a regular file: $BACKING_IMAGE"
     fi
 
-    if ! is_exfat_image "$BACKING_IMAGE"; then
+    if ! is_partitioned_exfat_image "$BACKING_IMAGE"; then
         die \
-            "$BACKING_IMAGE exists but does not contain an exFAT filesystem; refusing to overwrite it"
+            "$BACKING_IMAGE exists but is not an MBR-partitioned exFAT image; refusing to overwrite it"
     fi
 
     local size
     size="$(stat -c '%s' "$BACKING_IMAGE")"
 
     echo "fake disk already prepared:"
-    echo "  image: $BACKING_IMAGE"
-    echo "  size:  $size bytes"
-    echo "  type:  exFAT"
+    echo "  image:      $BACKING_IMAGE"
+    echo "  size:       $size bytes"
+    echo "  partition:  MBR partition 1"
+    echo "  start LBA:  $PARTITION_START_LBA"
+    echo "  offset:     $PARTITION_OFFSET bytes"
+    echo "  filesystem: exFAT"
 }
 
 ###############################################################################
@@ -407,7 +534,7 @@ Run: $0 prepare-tssniff"
 
     mount \
         -t exfat \
-        -o loop,sync \
+        -o "loop,offset=${PARTITION_OFFSET},sync" \
         "$GADGET_IMAGE" \
         "$TEST_MOUNT"
 
@@ -813,10 +940,14 @@ status_gadget() {
         echo "  backing: $BACKING_IMAGE"
         echo "  size:    $(stat -c '%s bytes' "$BACKING_IMAGE")"
 
-        if is_exfat_image "$BACKING_IMAGE"; then
-            echo "  format:  exFAT"
+        if is_partitioned_exfat_image "$BACKING_IMAGE"; then
+            echo "  layout:  MBR"
+            echo "  part:    1"
+            echo "  type:    0x07"
+            echo "  fs:      exFAT"
+            echo "  offset:  ${PARTITION_OFFSET} bytes"
         else
-            echo "  format:  UNKNOWN"
+            echo "  layout:  UNKNOWN"
         fi
 
         echo "  blocks:  $(du -h "$BACKING_IMAGE" | cut -f1)"
