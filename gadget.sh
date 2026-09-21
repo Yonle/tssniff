@@ -336,7 +336,7 @@ EOF
 
             if ! mkfs.fat \
                 -F 32 \
-		-s 128 \
+                -s 128 \
                 -n GUOXIN \
                 "${loop}p1"
             then
@@ -352,7 +352,7 @@ EOF
 
             if ! mkfs.exfat \
                 -n GUOXIN \
-		-c 128K \
+                -c 128K \
                 "${loop}p1"
             then
                 losetup -d "$loop" 2>/dev/null || true
