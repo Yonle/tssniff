@@ -4,33 +4,16 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"unicode/utf16"
 )
 
-type RangeKind uint8
-
-const (
-	RangeMeta RangeKind = iota
-	RangeNormal
-	RangeTS
-	RangeUnknown
-)
-
-type ByteRange struct {
-	Start uint64
-	End   uint64 // exclusive
-
-	Kind RangeKind
-	Name string
-}
-
 type ExfatTracker struct {
-	fd              *os.File
-	partitionOffset int64
+	fd        *os.File
+	partition Partition
 
 	mu    sync.RWMutex
 	meta  []ByteRange
@@ -39,15 +22,18 @@ type ExfatTracker struct {
 
 func NewExfatTracker(
 	fd *os.File,
-	partitionOffset int64,
+	partition Partition,
 ) *ExfatTracker {
 	return &ExfatTracker{
-		fd:              fd,
-		partitionOffset: partitionOffset,
+		fd:        fd,
+		partition: partition,
 	}
 }
 
-func (t *ExfatTracker) Classify(start, length uint64) []ByteRange {
+func (t *ExfatTracker) Classify(
+	start,
+	length uint64,
+) []ByteRange {
 	if length == 0 {
 		return nil
 	}
@@ -87,8 +73,10 @@ func (t *ExfatTracker) Classify(start, length uint64) []ByteRange {
 
 	// Remove duplicate boundaries.
 	uniq := bounds[:0]
+
 	for _, b := range bounds {
-		if len(uniq) == 0 || uniq[len(uniq)-1] != b {
+		if len(uniq) == 0 ||
+			uniq[len(uniq)-1] != b {
 			uniq = append(uniq, b)
 		}
 	}
@@ -150,6 +138,10 @@ func (t *ExfatTracker) OverlapsMetadata(
 	start,
 	length uint64,
 ) bool {
+	if length == 0 {
+		return false
+	}
+
 	end := start + length
 
 	t.mu.RLock()
@@ -165,12 +157,15 @@ func (t *ExfatTracker) OverlapsMetadata(
 }
 
 func (t *ExfatTracker) Refresh() error {
-	layout, err := readLayout(t.fd, t.partitionOffset)
+	layout, err := readExfatLayout(
+		t.fd,
+		t.partition,
+	)
 	if err != nil {
 		return err
 	}
 
-	state := &scanState{
+	state := &exfatScanState{
 		fd:      t.fd,
 		layout:  layout,
 		visited: make(map[uint32]bool),
@@ -182,10 +177,11 @@ func (t *ExfatTracker) Refresh() error {
 		*/
 		meta: []ByteRange{
 			{
-				Start: uint64(t.partitionOffset),
-				End:   uint64(t.partitionOffset) + layout.clusterHeapOffsetBytes,
-				Kind:  RangeMeta,
-				Name:  "boot+FAT",
+				Start: uint64(t.partition.Offset),
+				End: uint64(t.partition.Offset) +
+					layout.clusterHeapOffsetBytes,
+				Kind: RangeMeta,
+				Name: "boot+FAT",
 			},
 		},
 
@@ -216,29 +212,20 @@ func (t *ExfatTracker) Refresh() error {
 	t.meta = coalesceRanges(state.meta)
 	t.rules = coalesceRanges(state.ranges)
 	t.mu.Unlock()
-	/*
-	fmt.Printf(
-		"exFAT: %d TS ranges\n",
-		len(state.ranges),
-	)
 
-	for _, r := range state.ranges {
-		fmt.Printf(
-			"  TS %-40s [0x%x, 0x%x)  %d bytes\n",
-			r.Name,
-			r.Start,
-			r.End,
-			r.End-r.Start,
-		)
-	}*/
+	log.Printf(
+		"tracker refresh: %d meta ranges, %d file ranges",
+		len(t.meta),
+		len(t.rules),
+	)
 
 	return nil
 }
 
 type exfatLayout struct {
 	partitionOffset uint64
-	sectorSize      uint64
 
+	sectorSize        uint64
 	sectorsPerCluster uint64
 	clusterSize       uint64
 
@@ -256,15 +243,15 @@ type exfatLayout struct {
 	volumeLength uint64
 }
 
-func readLayout(
+func readExfatLayout(
 	fd *os.File,
-	partitionOffset int64,
+	partition Partition,
 ) (exfatLayout, error) {
-	if partitionOffset < 0 {
+	if partition.Offset < 0 {
 		return exfatLayout{},
 			fmt.Errorf(
 				"negative partition offset %d",
-				partitionOffset,
+				partition.Offset,
 			)
 	}
 
@@ -272,7 +259,7 @@ func readLayout(
 
 	if _, err := fd.ReadAt(
 		boot,
-		partitionOffset,
+		partition.Offset,
 	); err != nil {
 		return exfatLayout{}, err
 	}
@@ -353,9 +340,9 @@ func readLayout(
 	}
 
 	return exfatLayout{
-		partitionOffset: uint64(partitionOffset),
-		sectorSize:      sectorSize,
+		partitionOffset: uint64(partition.Offset),
 
+		sectorSize:        sectorSize,
 		sectorsPerCluster: sectorsPerCluster,
 		clusterSize:       clusterSize,
 
@@ -374,7 +361,7 @@ func readLayout(
 	}, nil
 }
 
-type scanState struct {
+type exfatScanState struct {
 	fd     *os.File
 	layout exfatLayout
 
@@ -386,7 +373,7 @@ type scanState struct {
 	maxDepth int
 }
 
-func (s *scanState) clusterOffset(
+func (s *exfatScanState) clusterOffset(
 	cluster uint32,
 ) (uint64, error) {
 	if cluster < 2 ||
@@ -403,10 +390,11 @@ func (s *scanState) clusterOffset(
 			(uint64(cluster)-2)*
 				s.layout.sectorsPerCluster
 
-	return s.layout.partitionOffset + sector*s.layout.sectorSize, nil
+	return s.layout.partitionOffset +
+		sector*s.layout.sectorSize, nil
 }
 
-func (s *scanState) fatOffset(
+func (s *exfatScanState) fatOffset(
 	cluster uint32,
 ) uint64 {
 	baseSector :=
@@ -419,7 +407,7 @@ func (s *scanState) fatOffset(
 		uint64(cluster)*4
 }
 
-func (s *scanState) nextCluster(
+func (s *exfatScanState) nextCluster(
 	cluster uint32,
 ) (uint32, error) {
 	var b [4]byte
@@ -434,11 +422,11 @@ func (s *scanState) nextCluster(
 	return binary.LittleEndian.Uint32(b[:]), nil
 }
 
-func isEOC(c uint32) bool {
+func isExfatEOC(c uint32) bool {
 	return c >= 0xFFFFFFF8
 }
 
-func (s *scanState) fatChain(
+func (s *exfatScanState) fatChain(
 	first uint32,
 	maxClusters uint64,
 ) ([]uint32, error) {
@@ -484,7 +472,7 @@ func (s *scanState) fatChain(
 			return nil, err
 		}
 
-		if isEOC(next) {
+		if isExfatEOC(next) {
 			break
 		}
 
@@ -502,7 +490,7 @@ func (s *scanState) fatChain(
 	return chain, nil
 }
 
-func clustersFor(
+func exfatClustersFor(
 	first uint32,
 	length uint64,
 	clusterSize uint64,
@@ -546,7 +534,7 @@ func clustersFor(
 	return fatChain(first, count)
 }
 
-func (s *scanState) walkRoot() error {
+func (s *exfatScanState) walkRoot() error {
 	chain, err := s.fatChain(
 		s.layout.rootCluster,
 		s.layout.clusterCount,
@@ -562,7 +550,7 @@ func (s *scanState) walkRoot() error {
 	)
 }
 
-func (s *scanState) walkSubdir(
+func (s *exfatScanState) walkSubdir(
 	firstCluster uint32,
 	length uint64,
 	noFatChain bool,
@@ -575,7 +563,7 @@ func (s *scanState) walkSubdir(
 		return nil
 	}
 
-	chain, err := clustersFor(
+	chain, err := exfatClustersFor(
 		firstCluster,
 		length,
 		s.layout.clusterSize,
@@ -593,7 +581,7 @@ func (s *scanState) walkSubdir(
 	)
 }
 
-func (s *scanState) parseDirectoryClusters(
+func (s *exfatScanState) parseDirectoryClusters(
 	chain []uint32,
 	parent string,
 	depth int,
@@ -673,7 +661,7 @@ func (s *scanState) parseDirectoryClusters(
 	)
 }
 
-func (s *scanState) parseDirectoryBytes(
+func (s *exfatScanState) parseDirectoryBytes(
 	buf []byte,
 	parent string,
 	depth int,
@@ -696,7 +684,7 @@ func (s *scanState) parseDirectoryBytes(
 			)
 
 			if firstCluster != 0 && dataLength != 0 {
-				clusters, err := clustersFor(
+				clusters, err := exfatClustersFor(
 					firstCluster,
 					dataLength,
 					s.layout.clusterSize,
@@ -712,7 +700,7 @@ func (s *scanState) parseDirectoryBytes(
 					name = "up-case table"
 				}
 
-				for _, r := range clustersToRanges(
+				for _, r := range clustersToExfatRanges(
 					clusters,
 					s.layout.clusterSize,
 					s,
@@ -766,9 +754,7 @@ func (s *scanState) parseDirectoryBytes(
 				for k := 0; k < 15; k++ {
 					nameWords = append(
 						nameWords,
-						binary.LittleEndian.Uint16(
-							secondary[2+k*2:4+k*2],
-						),
+						binary.LittleEndian.Uint16(secondary[2+k*2:4+k*2]),
 					)
 				}
 			}
@@ -822,7 +808,7 @@ func (s *scanState) parseDirectoryBytes(
 		if firstCluster != 0 &&
 			dataLength != 0 {
 
-			clusters, err := clustersFor(
+			clusters, err := exfatClustersFor(
 				firstCluster,
 				dataLength,
 				s.layout.clusterSize,
@@ -838,7 +824,7 @@ func (s *scanState) parseDirectoryBytes(
 			}
 
 			ranges :=
-				clustersToRanges(
+				clustersToExfatFullRanges(
 					clusters,
 					s.layout.clusterSize,
 					s,
@@ -857,10 +843,7 @@ func (s *scanState) parseDirectoryBytes(
 			} else {
 				kind := RangeNormal
 
-				if strings.HasSuffix(
-					strings.ToLower(fullName),
-					".ts",
-				) {
+				if isTSFile(fullName) {
 					kind = RangeTS
 				}
 
@@ -882,10 +865,10 @@ func (s *scanState) parseDirectoryBytes(
 	return nil
 }
 
-func clustersToRanges(
+func clustersToExfatRanges(
 	clusters []uint32,
 	clusterSize uint64,
-	s *scanState,
+	s *exfatScanState,
 ) []ByteRange {
 	if len(clusters) == 0 {
 		return nil
@@ -935,42 +918,104 @@ func clustersToRanges(
 	return ranges
 }
 
-func coalesceRanges(
-	in []ByteRange,
+func clustersToExfatFileRanges(
+	clusters []uint32,
+	clusterSize uint64,
+	fileLength uint64,
+	s *exfatScanState,
 ) []ByteRange {
-	if len(in) == 0 {
+	if len(clusters) == 0 || fileLength == 0 {
 		return nil
 	}
 
-	out := make(
-		[]ByteRange,
-		0,
-		len(in),
-	)
+	ranges := make([]ByteRange, 0, 4)
 
-	for _, r := range in {
-		if r.End <= r.Start {
-			continue
+	start := clusters[0]
+	prev := start
+	remaining := fileLength
+
+	flush := func(a, b uint32) {
+		startOff, _ := s.clusterOffset(a)
+		endOff, _ := s.clusterOffset(b)
+
+		clusterCount := uint64(b-a) + 1
+		runSize := clusterCount * clusterSize
+
+		if runSize > remaining {
+			runSize = remaining
 		}
 
-		if len(out) > 0 &&
-			out[len(out)-1].End >= r.Start &&
-			out[len(out)-1].Kind == r.Kind &&
-			out[len(out)-1].Name == r.Name {
+		endOff = startOff + runSize
 
-			if r.End > out[len(out)-1].End {
-				out[len(out)-1].End = r.End
-			}
+		ranges = append(ranges, ByteRange{
+			Start: startOff,
+			End:   endOff,
+		})
 
-			continue
-		}
-
-		out = append(out, r)
+		remaining -= runSize
 	}
 
-	return out
+	for _, cluster := range clusters[1:] {
+		if cluster == prev+1 {
+			prev = cluster
+			continue
+		}
+
+		flush(start, prev)
+
+		if remaining == 0 {
+			break
+		}
+
+		start = cluster
+		prev = cluster
+	}
+
+	if remaining > 0 {
+		flush(start, prev)
+	}
+
+	return ranges
 }
 
-func findExFATPartition(f *os.File) (Partition, error) {
-	return findMBRExFATPartition(f)
+func clustersToExfatFullRanges(
+	clusters []uint32,
+	clusterSize uint64,
+	s *exfatScanState,
+) []ByteRange {
+	if len(clusters) == 0 {
+		return nil
+	}
+
+	ranges := make([]ByteRange, 0, 4)
+
+	start := clusters[0]
+	prev := start
+
+	flush := func(a, b uint32) {
+		startOff, _ := s.clusterOffset(a)
+		endOff, _ := s.clusterOffset(b)
+		endOff += clusterSize
+
+		ranges = append(ranges, ByteRange{
+			Start: startOff,
+			End:   endOff,
+		})
+	}
+
+	for _, cluster := range clusters[1:] {
+		if cluster == prev+1 {
+			prev = cluster
+			continue
+		}
+
+		flush(start, prev)
+
+		start = cluster
+		prev = cluster
+	}
+
+	flush(start, prev)
+
+	return ranges
 }

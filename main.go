@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -21,12 +22,6 @@ type DiskFS struct {
 	fs.Inode
 }
 
-type Partition struct {
-	Offset int64
-	Size   int64
-	Type   byte
-}
-
 var (
 	_ fs.InodeEmbedder = (*DiskFS)(nil)
 	_ fs.NodeGetattrer = (*DiskFS)(nil)
@@ -38,7 +33,7 @@ type DiskNode struct {
 
 	fd      *os.File
 	size    uint64
-	tracker *ExfatTracker
+	tracker Tracker
 	hub     *Hub
 
 	pendingMu sync.Mutex
@@ -250,6 +245,20 @@ func (d *DiskNode) Write(
 		uint64(len(data)),
 	)
 
+	// Pre-scan: if any part of this write is unknown, this is almost
+	// certainly a read-modify-write of a file tail whose metadata has
+	// not been updated yet. The TS bytes in the buffer are OLD data
+	// that has already been broadcast, so we must not re-send them.
+	// The unknown tail is quarantined and replayed after the metadata
+	// write triggers a tracker Refresh.
+	hasUnknown := false
+	for _, seg := range segments {
+		if seg.Kind == RangeUnknown {
+			hasUnknown = true
+			break
+		}
+	}
+
 	metadataChanged := false
 
 	for _, seg := range segments {
@@ -260,6 +269,11 @@ func (d *DiskNode) Write(
 
 		switch seg.Kind {
 		case RangeTS:
+			// Old TS data that the filesystem rewrote back.
+			if hasUnknown {
+				continue
+			}
+
 			log.Printf(
 				"TS WRITE offset=%d size=%d file=%s",
 				seg.Start,
@@ -276,13 +290,11 @@ func (d *DiskNode) Write(
 			)
 
 			if err != nil {
-				return uint32(rel + uint64(n)),
-					toErrno(err)
+				return uint32(rel + uint64(n)), toErrno(err)
 			}
 
 			if n != len(part) {
-				return uint32(rel + uint64(n)),
-					syscall.EIO
+				return uint32(rel + uint64(n)), syscall.EIO
 			}
 
 			if seg.Kind == RangeMeta {
@@ -306,10 +318,11 @@ func (d *DiskNode) Write(
 		Refresh AFTER writing the metadata to the backing image.
 	*/
 	if metadataChanged {
-		log.Printf("exFAT metadata changed; refreshing tracker")
+		log.Printf("filesystem metadata changed; refreshing tracker")
+
 		if err := d.tracker.Refresh(); err != nil {
 			log.Printf(
-				"exFAT refresh: %v",
+				"tracker refresh: %v",
 				err,
 			)
 
@@ -387,7 +400,10 @@ func (h *Hub) Serve(addr string) error {
 		return err
 	}
 
-	log.Printf("TS TCP server listening on %s", addr)
+	log.Printf(
+		"TS TCP server listening on %s",
+		addr,
+	)
 
 	for {
 		conn, err := ln.Accept()
@@ -436,7 +452,10 @@ func (h *Hub) Serve(addr string) error {
 			}()
 
 			for payload := range c.q {
-				err := writeFull(conn, payload)
+				err := writeFull(
+					conn,
+					payload,
+				)
 
 				releasePayload(payload)
 
@@ -448,7 +467,10 @@ func (h *Hub) Serve(addr string) error {
 	}
 }
 
-func writeFull(w net.Conn, p []byte) error {
+func writeFull(
+	w net.Conn,
+	p []byte,
+) error {
 	offset := 0
 
 	for offset < len(p) {
@@ -474,7 +496,6 @@ func (h *Hub) Broadcast(data []byte) {
 
 		Make one owned copy from the payload pool.
 	*/
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -500,6 +521,32 @@ func (h *Hub) Broadcast(data []byte) {
 	}
 }
 
+func newTracker(
+	fd *os.File,
+	partition Partition,
+	filesystem string,
+) (Tracker, error) {
+	switch filesystem {
+	case "fat32":
+		return NewFAT32Tracker(
+			fd,
+			partition,
+		)
+
+	case "exfat":
+		return NewExfatTracker(
+			fd,
+			partition,
+		), nil
+
+	default:
+		return nil, fmt.Errorf(
+			"unsupported filesystem %q",
+			filesystem,
+		)
+	}
+}
+
 func main() {
 	mountPoint := flag.String(
 		"mount",
@@ -519,6 +566,12 @@ func main() {
 		"TCP TS listener",
 	)
 
+	filesystem := flag.String(
+		"fs",
+		"fat32",
+		"filesystem to use",
+	)
+
 	debug := flag.Bool(
 		"debug",
 		false,
@@ -533,11 +586,17 @@ func main() {
 	}
 
 	if !st.Mode().IsRegular() {
-		log.Fatalf("%s is not a regular file", *image)
+		log.Fatalf(
+			"%s is not a regular file",
+			*image,
+		)
 	}
 
 	if st.Size() <= 0 {
-		log.Fatalf("%s is empty", *image)
+		log.Fatalf(
+			"%s is empty",
+			*image,
+		)
 	}
 
 	fd, err := os.OpenFile(
@@ -558,30 +617,51 @@ func main() {
 		0600,
 	)
 	if err != nil {
-		log.Fatal("open quarantine file: ", err)
+		log.Fatal(
+			"open quarantine file: ",
+			err,
+		)
 	}
 	defer quarantine.Close()
 
 	hub := NewHub()
 
-	partition, err := findExFATPartition(fd)
+	partition, err := findMBRPartition(
+		fd,
+		*filesystem,
+	)
 	if err != nil {
-		log.Fatal("find exFAT partition: ", err)
+		log.Fatal(
+			"find partition: ",
+			err,
+		)
 	}
 
 	log.Printf(
-		"exFAT partition: offset=%d size=%d\n",
+		"%s partition: offset=%d size=%d type=0x%02x",
+		*filesystem,
 		partition.Offset,
 		partition.Size,
+		partition.Type,
 	)
 
-	tracker := NewExfatTracker(
+	tracker, err := newTracker(
 		fd,
-		partition.Offset,
+		partition,
+		*filesystem,
 	)
+	if err != nil {
+		log.Fatal(
+			"create tracker: ",
+			err,
+		)
+	}
 
 	if err := tracker.Refresh(); err != nil {
-		log.Fatal("initial exFAT scan: ", err)
+		log.Fatal(
+			"initial tracker scan: ",
+			err,
+		)
 	}
 
 	root := &DiskFS{}
@@ -643,18 +723,25 @@ func main() {
 
 	go func() {
 		if err := hub.Serve(*listenAddr); err != nil {
-			log.Printf("TCP server stopped: %v", err)
+			log.Printf(
+				"TCP server stopped: %v",
+				err,
+			)
 		}
 	}()
 
 	log.Printf(
 		"FUSE disk: %s",
-		filepath.Join(*mountPoint, "disk.img"),
+		filepath.Join(
+			*mountPoint,
+			"disk.img",
+		),
 	)
 
 	log.Printf(
 		"logical size: %.2f GiB",
-		float64(st.Size())/(1024*1024*1024),
+		float64(st.Size())/
+			(1024*1024*1024),
 	)
 
 	stopCtx, stop := signal.NotifyContext(
@@ -684,7 +771,9 @@ func (d *DiskNode) queuePending(
 	defer d.pendingMu.Unlock()
 
 	if d.quarantine == nil {
-		return errors.New("quarantine file is not open")
+		return errors.New(
+			"quarantine file is not open",
+		)
 	}
 
 	spoolOffset := d.quarantineNext
@@ -761,6 +850,8 @@ func (d *DiskNode) resolvePending() error {
 		return nil
 	}
 
+	seen := make(map[[2]uint64]struct{}, len(pending))
+
 	var buf []byte
 
 	for _, p := range pending {
@@ -820,6 +911,12 @@ func (d *DiskNode) resolvePending() error {
 				}
 
 			case RangeUnknown:
+				key := [2]uint64{seg.Start, seg.End - seg.Start}
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+
 				if err := d.queuePending(
 					seg.Start,
 					part,

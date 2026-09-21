@@ -7,15 +7,15 @@ set -euo pipefail
 # Commands:
 #
 #   prepare-fakedisk
-#       Create/check the real sparse exFAT backing image.
+#       Create/check the real sparse backing image.
 #
 #   mount
 #       TEST ONLY:
-#       Mount the FUSE-exposed disk.img as exFAT.
+#       Mount the FUSE-exposed disk.img using the selected filesystem.
 #
 #   unmount
 #       TEST ONLY:
-#       Unmount the test exFAT filesystem.
+#       Unmount the test filesystem.
 #
 #   prepare-tssniff
 #       Start tssniff in the background and wait for its FUSE disk.
@@ -57,6 +57,22 @@ GADGET_IMAGE="${GADGET_IMAGE:-/mnt/tsdisk/disk.img}"
 TEST_MOUNT="${TEST_MOUNT:-/mnt/guoxin}"
 
 ###############################################################################
+# Filesystem
+###############################################################################
+
+# Accepted values:
+#
+#   fat32
+#   vfat   -> alias for fat32
+#   exfat
+#
+FILESYSTEM="${FILESYSTEM:-fat32}"
+
+TSSNIFF_FILESYSTEM=""
+MOUNT_FILESYSTEM=""
+BLKID_FILESYSTEM=""
+
+###############################################################################
 # tssniff
 ###############################################################################
 
@@ -77,7 +93,7 @@ DISK_SIZE="${DISK_SIZE:-1T}"
 SECTOR_SIZE="${SECTOR_SIZE:-512}"
 
 PARTITION_START_LBA="${PARTITION_START_LBA:-2048}"
-PARTITION_TYPE="${PARTITION_TYPE:-7}"
+PARTITION_TYPE="${PARTITION_TYPE:-}"
 
 PARTITION_OFFSET="$(
     echo $((PARTITION_START_LBA * SECTOR_SIZE))
@@ -128,9 +144,44 @@ write_attr() {
     local value="$1"
     local path="$2"
 
-    echo "write_attr: $path"
-
     printf '%s\n' "$value" > "$path"
+}
+
+###############################################################################
+# Filesystem configuration
+###############################################################################
+
+configure_filesystem() {
+    case "$FILESYSTEM" in
+        fat32|vfat)
+            # "vfat" is Linux's driver/filesystem name.
+            # The on-disk filesystem and tssniff tracker are FAT32.
+            TSSNIFF_FILESYSTEM="fat32"
+            MOUNT_FILESYSTEM="vfat"
+            BLKID_FILESYSTEM="vfat"
+
+            if [[ -z "$PARTITION_TYPE" ]]; then
+                # FAT32 LBA.
+                PARTITION_TYPE=0c
+            fi
+            ;;
+
+        exfat)
+            TSSNIFF_FILESYSTEM="exfat"
+            MOUNT_FILESYSTEM="exfat"
+            BLKID_FILESYSTEM="exfat"
+
+            if [[ -z "$PARTITION_TYPE" ]]; then
+                # Microsoft basic data / exFAT.
+                PARTITION_TYPE=7
+            fi
+            ;;
+
+        *)
+            die \
+                "unsupported filesystem: $FILESYSTEM (use fat32, vfat, or exfat)"
+            ;;
+    esac
 }
 
 ###############################################################################
@@ -159,7 +210,7 @@ ensure_configfs() {
 # Fake disk
 ###############################################################################
 
-is_partitioned_exfat_image() {
+is_partitioned_filesystem_image() {
     [[ -f "$1" ]] || return 1
 
     ###########################################################################
@@ -202,10 +253,10 @@ is_partitioned_exfat_image() {
 
     losetup -d "$loop" 2>/dev/null || true
 
-    [[ "$type" == "exfat" ]]
+    [[ "$type" == "$BLKID_FILESYSTEM" ]]
 }
 
-create_partitioned_exfat_image() {
+create_partitioned_filesystem_image() {
     local image="$1"
 
     local size
@@ -275,17 +326,40 @@ EOF
             "partition device did not appear: ${loop}p1"
     fi
 
-    info "formatting partition 1 as exFAT"
+    ###########################################################################
+    # Format filesystem.
+    ###########################################################################
 
-    if ! mkfs.exfat \
-        -n GUOXIN \
-        "${loop}p1"
-    then
-        losetup -d "$loop" 2>/dev/null || true
+    case "$FILESYSTEM" in
+        fat32|vfat)
+            info "formatting partition 1 as FAT32"
 
-        die \
-            "failed to format ${loop}p1 as exFAT"
-    fi
+            if ! mkfs.fat \
+                -F 32 \
+                -n GUOXIN \
+                "${loop}p1"
+            then
+                losetup -d "$loop" 2>/dev/null || true
+
+                die \
+                    "failed to format ${loop}p1 as FAT32"
+            fi
+            ;;
+
+        exfat)
+            info "formatting partition 1 as exFAT"
+
+            if ! mkfs.exfat \
+                -n GUOXIN \
+                "${loop}p1"
+            then
+                losetup -d "$loop" 2>/dev/null || true
+
+                die \
+                    "failed to format ${loop}p1 as exFAT"
+            fi
+            ;;
+    esac
 
     losetup -d "$loop"
 
@@ -294,10 +368,10 @@ EOF
     echo "  image:      $image"
     echo "  size:       $(stat -c '%s bytes' "$image")"
     echo "  partition:  1"
-    echo "  type:       MBR 0x07"
+    echo "  type:       MBR 0x${PARTITION_TYPE}"
     echo "  start LBA:  $PARTITION_START_LBA"
     echo "  offset:     $PARTITION_OFFSET bytes"
-    echo "  filesystem: exFAT"
+    echo "  filesystem: $FILESYSTEM"
 }
 
 prepare_fakedisk() {
@@ -316,7 +390,8 @@ prepare_fakedisk() {
             -s "$DISK_SIZE" \
             "$BACKING_IMAGE"
 
-        create_partitioned_exfat_image "$BACKING_IMAGE"
+        create_partitioned_filesystem_image \
+            "$BACKING_IMAGE"
 
         return
     fi
@@ -326,9 +401,11 @@ prepare_fakedisk() {
             "backing image exists but is not a regular file: $BACKING_IMAGE"
     fi
 
-    if ! is_partitioned_exfat_image "$BACKING_IMAGE"; then
+    if ! is_partitioned_filesystem_image \
+        "$BACKING_IMAGE"
+    then
         die \
-            "$BACKING_IMAGE exists but is not an MBR-partitioned exFAT image; refusing to overwrite it"
+            "$BACKING_IMAGE exists but is not an MBR-partitioned $FILESYSTEM image; refusing to overwrite it"
     fi
 
     local size
@@ -338,9 +415,10 @@ prepare_fakedisk() {
     echo "  image:      $BACKING_IMAGE"
     echo "  size:       $size bytes"
     echo "  partition:  MBR partition 1"
+    echo "  type:    0x${PARTITION_TYPE}"
     echo "  start LBA:  $PARTITION_START_LBA"
     echo "  offset:     $PARTITION_OFFSET bytes"
-    echo "  filesystem: exFAT"
+    echo "  filesystem: $FILESYSTEM"
 }
 
 ###############################################################################
@@ -414,6 +492,7 @@ prepare_tssniff() {
         -image "$BACKING_IMAGE" \
         -mount "$TSSNIFF_MOUNT" \
         -listen "$TSSNIFF_LISTEN" \
+        -fs "$TSSNIFF_FILESYSTEM" \
         > /var/log/guoxin-tssniff.log \
         2>&1 &
 
@@ -421,10 +500,11 @@ prepare_tssniff() {
 
     printf '%s\n' "$pid" > "$TSSNIFF_PIDFILE"
 
-    echo "  PID:    $pid"
-    echo "  log:    /var/log/guoxin-tssniff.log"
-    echo "  mount:  $TSSNIFF_MOUNT"
-    echo "  listen: $TSSNIFF_LISTEN"
+    echo "  PID:        $pid"
+    echo "  log:        /var/log/guoxin-tssniff.log"
+    echo "  mount:      $TSSNIFF_MOUNT"
+    echo "  listen:     $TSSNIFF_LISTEN"
+    echo "  filesystem: $TSSNIFF_FILESYSTEM"
 
     wait_for_tssniff
 }
@@ -528,12 +608,13 @@ Run: $0 prepare-tssniff"
         return
     fi
 
-    info "mounting FUSE disk as exFAT"
-    info "source: $GADGET_IMAGE"
-    info "target: $TEST_MOUNT"
+    info "mounting FUSE disk"
+    info "filesystem: $MOUNT_FILESYSTEM"
+    info "source:     $GADGET_IMAGE"
+    info "target:     $TEST_MOUNT"
 
     mount \
-        -t exfat \
+        -t "$MOUNT_FILESYSTEM" \
         -o "loop,offset=${PARTITION_OFFSET},sync" \
         "$GADGET_IMAGE" \
         "$TEST_MOUNT"
@@ -739,6 +820,7 @@ Run: $0 prepare-tssniff"
     echo
     echo "  gadget:        $GADGET_NAME"
     echo "  image:         $GADGET_IMAGE"
+    echo "  filesystem:    $FILESYSTEM"
     echo
     echo "  VID:           $VID"
     echo "  PID:           $PID"
@@ -785,11 +867,12 @@ bind_gadget() {
     echo " USB GADGET ACTIVE"
     echo "========================================"
     echo
-    echo "  Gadget: $GADGET_NAME"
-    echo "  UDC:    $UDC"
-    echo "  Image:  $GADGET_IMAGE"
-    echo "  VID:    $VID"
-    echo "  PID:    $PID"
+    echo "  Gadget:     $GADGET_NAME"
+    echo "  UDC:        $UDC"
+    echo "  Image:      $GADGET_IMAGE"
+    echo "  Filesystem: $FILESYSTEM"
+    echo "  VID:        $VID"
+    echo "  PID:        $PID"
     echo
 }
 
@@ -942,11 +1025,15 @@ status_gadget() {
         echo "  backing: $BACKING_IMAGE"
         echo "  size:    $(stat -c '%s bytes' "$BACKING_IMAGE")"
 
-        if is_partitioned_exfat_image "$BACKING_IMAGE"; then
+        if is_partitioned_filesystem_image "$BACKING_IMAGE"; then
             echo "  layout:  MBR"
             echo "  part:    1"
-            echo "  type:    0x07"
-            echo "  fs:      exFAT"
+
+            printf \
+                '  type:    0x%02x\n' \
+                "$PARTITION_TYPE"
+
+            echo "  fs:      $FILESYSTEM"
             echo "  offset:  ${PARTITION_OFFSET} bytes"
         else
             echo "  layout:  UNKNOWN"
@@ -970,6 +1057,7 @@ status_gadget() {
         echo "  pid:     $(cat "$TSSNIFF_PIDFILE")"
         echo "  mount:   $TSSNIFF_MOUNT"
         echo "  listen:  $TSSNIFF_LISTEN"
+        echo "  fs:      $TSSNIFF_FILESYSTEM"
     else
         echo "  state:   stopped"
     fi
@@ -1070,6 +1158,9 @@ usage:
 
 Environment:
 
+  FILESYSTEM=fat32
+      fat32 (default), vfat, or exfat
+
   BACKING_IMAGE=/srv/guoxin.img
   GADGET_IMAGE=/mnt/tsdisk/disk.img
   TEST_MOUNT=/mnt/guoxin
@@ -1081,6 +1172,7 @@ Environment:
   TSSNIFF_START_TIMEOUT=15
 
   DISK_SIZE=1T
+  PARTITION_START_LBA=2048
 
   UDC=<udc-name>
 
@@ -1100,15 +1192,13 @@ Examples:
 
   sudo $0 prepare-fakedisk
 
-  sudo $0 prepare-tssniff
+  sudo FILESYSTEM=fat32 $0 start
 
-  sudo $0 mount
+  sudo FILESYSTEM=vfat $0 start
 
-  sudo $0 prepare-gadget
+  sudo FILESYSTEM=exfat $0 start
 
-  sudo $0 find-udc
-
-  sudo $0 start
+  sudo FILESYSTEM=fat32 $0 mount
 
   sudo $0 status
 
@@ -1120,6 +1210,8 @@ EOF
 ###############################################################################
 # Main
 ###############################################################################
+
+configure_filesystem
 
 case "${1:-}" in
     prepare-fakedisk)
