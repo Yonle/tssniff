@@ -17,7 +17,7 @@ type DiskNode struct {
 	imgFile  *os.File
 	size     uint64
 	hub      *Hub
-	tracker  Tracker
+	tracker  *FSTracker
 	preserve bool
 	shm      *ShmBuffer
 
@@ -146,6 +146,18 @@ func (d *DiskNode) Write(
 			if n != len(part) {
 				return uint32(rel + uint64(n)), syscall.EIO
 			}
+
+			// A write to the root directory means the STB is
+			// creating, updating, or closing a directory entry —
+			// i.e. a new recording is starting.  Reset the TS
+			// continuity state so the first write of the new
+			// recording is accepted regardless of its offset.
+			if d.tracker.InRootDir(seg.Start) {
+				if verbLog {
+					log.Printf("root dir write at %d: reset TS continuity", seg.Start)
+				}
+				d.tsHaveData = false
+			}
 		}
 	}
 
@@ -168,18 +180,29 @@ func (d *DiskNode) Fsync(
 }
 
 func (d *DiskNode) broadcastTS(data []byte, off uint64) {
-	// Reject any write whose offset does not continue the current TS
-	// stream.  The STB's bookkeeping writes (512 B at fixed offsets)
-	// are far away from the recording file and would otherwise sit in
-	// tsBuf as junk, forcing the resync below to drop the partial
-	// packet at the head of the next real TS write.
-	if d.tsHaveData && off != d.tsNextOff {
-		if verbLog {
-			log.Printf("broadcastTS: skip non-contiguous off=%d (want %d) len=%d",
-				off, d.tsNextOff, len(data))
+	if d.tsHaveData {
+		if off < d.tsNextOff {
+			// Backwards write: bookkeeping at the file's start.
+			// Dropping these is what keeps the stream clean.
+			if verbLog {
+				log.Printf("broadcastTS: skip backwards off=%d (frontier %d)",
+					off, d.tsNextOff)
+			}
+			return
 		}
-		return
+		if off > d.tsNextOff {
+			// Forward jump: a new recording started.  Flush any
+			// partial packet left from the previous file and start
+			// the buffer over.
+			if verbLog {
+				log.Printf("broadcastTS: forward jump off=%d (was %d), reset",
+					off, d.tsNextOff)
+			}
+			d.tsBuf = d.tsBuf[:0]
+		}
+		// off == tsNextOff: normal continuation, fall through.
 	}
+
 	d.tsNextOff = off + uint64(len(data))
 	d.tsHaveData = true
 

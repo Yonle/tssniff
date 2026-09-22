@@ -8,12 +8,16 @@ import (
 type Tracker interface {
 	Classify(start, length uint64) []ByteRange
 	MetadataEnd() uint64
+	InRootDir(off uint64) bool
 }
 
 type FSTracker struct {
 	fsType      string
 	partition   Partition
 	metadataEnd uint64
+	dataStart   uint64
+	rootStart   uint64
+	rootEnd     uint64
 	bytesPerSec uint32
 }
 
@@ -73,10 +77,35 @@ func (t *FSTracker) initMetadataBoundaries(r io.ReaderAt) {
 	if t.metadataEnd > partEnd {
 		t.metadataEnd = partEnd
 	}
+
+	// dataStart = first byte of the data region (cluster 2).
+	// The root directory lives there for FAT32.
+	t.dataStart = uint64(t.partition.Offset) +
+		(uint64(rsvd)+uint64(nfat)*uint64(fsz))*uint64(bps)
+
+	clusterSize := uint64(spc) * uint64(bps)
+
+	if fsz > 0 && nfat > 0 {
+		rootCluster := binary.LittleEndian.Uint32(boot[44:48])
+		if rootCluster < 2 {
+			rootCluster = 2
+		}
+		t.rootStart = t.dataStart + (uint64(rootCluster)-2)*clusterSize
+		t.rootEnd = t.rootStart + clusterSize
+	} else {
+		// Non-FAT32: treat the first 32 KB of the data region as
+		// the directory area.
+		t.rootStart = t.dataStart
+		t.rootEnd = t.dataStart + 32*1024
+	}
 }
 
 func (t *FSTracker) MetadataEnd() uint64 {
 	return t.metadataEnd
+}
+
+func (t *FSTracker) InRootDir(off uint64) bool {
+	return off >= t.rootStart && off < t.rootEnd
 }
 
 func (t *FSTracker) Classify(start, length uint64) []ByteRange {

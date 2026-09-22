@@ -18,10 +18,16 @@ func startStreamServer(addr string, hub *Hub) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "video/mp2t")
-		w.Header().Set("Transfer-Encoding", "chunked")
 		w.Header().Set("Cache-Control", "no-cache")
 
 		flusher, _ := w.(http.Flusher)
+
+		// Send headers now.  Without this, Go buffers them until the
+		// first body write, and a client that connects while no TS
+		// data is being broadcast sees a connection that hangs.
+		if flusher != nil {
+			flusher.Flush()
+		}
 
 		client := hub.Register(r.Context())
 		defer hub.Unregister(client)
