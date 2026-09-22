@@ -5,8 +5,8 @@ import (
 )
 
 const (
-	payloadPoolSize = 16 * 1024
-	maxPooledSize   = 64 * 1024
+	payloadPoolSize = 128 * 1024
+	maxPooledSize   = 256 * 1024
 )
 
 var payloadPool = sync.Pool{

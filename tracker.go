@@ -1,9 +1,13 @@
 package main
 
+import (
+	"sort"
+	"sync/atomic"
+)
+
 type Tracker interface {
 	Classify(start, length uint64) []ByteRange
-	Snapshot() []ByteRange
-	OverlapsMetadata(start, length uint64) bool
+	TSRanges() []ByteRange
 	Refresh() error
 }
 
@@ -24,151 +28,94 @@ type ByteRange struct {
 	Name string
 }
 
-func coalesceRanges(
-	in []ByteRange,
-) []ByteRange {
-	if len(in) == 0 {
-		return nil
-	}
-
-	out := make(
-		[]ByteRange,
-		0,
-		len(in),
-	)
-
-	for _, r := range in {
-		if r.End <= r.Start {
-			continue
-		}
-
-		if len(out) > 0 &&
-			out[len(out)-1].End >= r.Start &&
-			out[len(out)-1].Kind == r.Kind &&
-			out[len(out)-1].Name == r.Name {
-
-			if r.End > out[len(out)-1].End {
-				out[len(out)-1].End = r.End
-			}
-
-			continue
-		}
-
-		out = append(out, r)
-	}
-
-	return out
+type trackerSnapshot struct {
+	meta       []ByteRange
+	ts         []ByteRange
+	classified []ByteRange
 }
 
-func classifyRanges(
-	meta,
-	rules []ByteRange,
-	start,
-	length uint64,
-) []ByteRange {
+type rangeStore struct {
+	state atomic.Pointer[trackerSnapshot]
+}
+
+func newRangeStore() *rangeStore {
+	s := &rangeStore{}
+	s.state.Store(&trackerSnapshot{})
+	return s
+}
+
+func (s *rangeStore) set(meta, rules []ByteRange) {
+	ts := make([]ByteRange, 0, 4)
+	for _, r := range rules {
+		if r.Kind == RangeTS {
+			ts = append(ts, r)
+		}
+	}
+
+	s.state.Store(&trackerSnapshot{
+		meta:       meta,
+		ts:         ts,
+		classified: buildClassification(meta, rules),
+	})
+}
+
+func (s *rangeStore) Classify(start, length uint64) []ByteRange {
 	if length == 0 {
 		return nil
 	}
 
 	end := start + length
+	ranges := s.state.Load().classified
+	out := make([]ByteRange, 0, 4)
 
-	bounds := []uint64{start, end}
+	i := sort.Search(len(ranges), func(i int) bool {
+		return ranges[i].End > start
+	})
 
-	addBounds := func(r ByteRange) {
-		if r.End <= start || r.Start >= end {
-			return
-		}
+	pos := start
+	for i < len(ranges) && pos < end {
+		r := ranges[i]
 
-		if r.Start > start && r.Start < end {
-			bounds = append(bounds, r.Start)
-		}
-
-		if r.End > start && r.End < end {
-			bounds = append(bounds, r.End)
-		}
-	}
-
-	for _, r := range meta {
-		addBounds(r)
-	}
-
-	for _, r := range rules {
-		addBounds(r)
-	}
-
-	sortUint64s(bounds)
-
-	uniq := bounds[:0]
-
-	for _, b := range bounds {
-		if len(uniq) == 0 ||
-			uniq[len(uniq)-1] != b {
-			uniq = append(uniq, b)
-		}
-	}
-
-	out := make(
-		[]ByteRange,
-		0,
-		len(uniq)-1,
-	)
-
-	for i := 0; i+1 < len(uniq); i++ {
-		a := uniq[i]
-		b := uniq[i+1]
-
-		if a == b {
-			continue
-		}
-
-		kind := RangeUnknown
-		name := ""
-
-		// Metadata gets priority.
-		for _, r := range meta {
-			if r.Start <= a && b <= r.End {
-				kind = RangeMeta
-				name = r.Name
+		if r.Start > pos {
+			gapEnd := minU64(r.Start, end)
+			out = append(out, ByteRange{
+				Start: pos,
+				End:   gapEnd,
+				Kind:  RangeUnknown,
+			})
+			pos = gapEnd
+			if pos == end {
 				break
 			}
 		}
 
-		if kind == RangeUnknown {
-			for _, r := range rules {
-				if r.Start <= a && b <= r.End {
-					kind = r.Kind
-					name = r.Name
-					break
-				}
-			}
+		if r.End <= pos {
+			i++
+			continue
 		}
 
-		out = append(
-			out,
-			ByteRange{
-				Start: a,
-				End:   b,
-				Kind:  kind,
-				Name:  name,
-			},
-		)
+		b := minU64(r.End, end)
+		out = append(out, ByteRange{
+			Start: pos,
+			End:   b,
+			Kind:  r.Kind,
+			Name:  r.Name,
+		})
+		pos = b
+		i++
 	}
 
-	return coalesceRanges(out)
+	if pos < end {
+		out = append(out, ByteRange{
+			Start: pos,
+			End:   end,
+			Kind:  RangeUnknown,
+		})
+	}
+
+	return out
 }
 
-func sortUint64s(v []uint64) {
-	// Tiny local helper so tracker implementations don't need to
-	// know how classification is implemented.
-	for i := 1; i < len(v); i++ {
-		x := v[i]
-		j := i - 1
-
-		for j >= 0 && v[j] > x {
-			v[j+1] = v[j]
-			j--
-		}
-
-		v[j+1] = x
-	}
+func (s *rangeStore) TSRanges() []ByteRange {
+	return s.state.Load().ts
 }
