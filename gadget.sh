@@ -11,10 +11,12 @@ set -euo pipefail
 #
 #   prepare-tssniff
 #       modprobe nbd, start tssniff in the background (NBD server + nbd-client
-#       attachment), and wait for /dev/nbdN to become ready.
+#       attachment + USB gadget configuration), and wait for /dev/nbdN to
+#       become ready.
 #
 #   stop-tssniff
-#       Stop the tssniff instance started by this script.
+#       Stop the tssniff instance started by this script.  tssniff tears down
+#       its own USB gadget on shutdown.
 #
 #   mount
 #       TEST ONLY:
@@ -25,21 +27,20 @@ set -euo pipefail
 #       Unmount the test filesystem.
 #
 #   prepare-gadget
-#       Create the ConfigFS USB Mass Storage gadget with /dev/nbdN as LUN 0.
-#       Does NOT bind it to a UDC.
+#       Load the libcomposite kernel module and mount ConfigFS.  All gadget
+#       configuration (descriptors, functions, UDC bind) is performed by
+#       tssniff itself.
 #
 #   find-udc
 #       Find/print available USB Device Controllers.
 #
 #   start
 #       prepare-fakedisk
-#       prepare-tssniff
-#       prepare-gadget
-#       find-udc
-#       bind gadget
+#       prepare-gadget (libcomposite only)
+#       prepare-tssniff (which configures the gadget)
 #
 #   stop
-#       Unbind/remove gadget and stop tssniff.
+#       Stop tssniff (which tears down its own gadget).
 #
 #   status
 #       Show state of disk, NBD device, tssniff and gadget.
@@ -111,6 +112,10 @@ PARTITION_OFFSET="$(
 
 ###############################################################################
 # USB gadget
+#
+# NOTE:
+#   VID, PID, and descriptor strings are configured by tssniff itself
+#   (see usb_gadget.go).  They are not passed through this script.
 ###############################################################################
 
 GADGET_NAME="${GADGET_NAME:-guoxin}"
@@ -119,19 +124,6 @@ CONFIGFS="${CONFIGFS:-/sys/kernel/config}"
 GADGET="${CONFIGFS}/usb_gadget/${GADGET_NAME}"
 
 UDC="${UDC:-}"
-
-VID="${VID:-0x1d6b}"
-PID="${PID:-0x0104}"
-
-BCD_USB="${BCD_USB:-0x0200}"
-BCD_DEVICE="${BCD_DEVICE:-0x0100}"
-
-SERIAL="${SERIAL:-GUOXIN-TS-0001}"
-MANUFACTURER="${MANUFACTURER:-Yonle Lab}"
-PRODUCT="${PRODUCT:-USB Mass Storage}"
-CONFIGURATION="${CONFIGURATION:-Mass Storage}"
-
-MAX_POWER="${MAX_POWER:-250}"
 
 ###############################################################################
 # Helpers
@@ -153,6 +145,8 @@ warn() {
 write_attr() {
     local value="$1"
     local path="$2"
+
+    info "write $path = ${value:-<empty>}"
 
     printf '%s\n' "$value" > "$path"
 }
@@ -220,27 +214,6 @@ ensure_configfs() {
 # NBD helpers
 ###############################################################################
 
-prepare_nbd_module() {
-    need_root
-
-    if ! grep -q '^nbd ' /proc/modules 2>/dev/null; then
-        info "loading nbd module (nbds_max=${NBD_MODULE_NBDS_MAX}, max_part=${NBD_MODULE_MAX_PART})"
-
-        if ! modprobe nbd \
-            nbds_max="${NBD_MODULE_NBDS_MAX}" \
-            max_part="${NBD_MODULE_MAX_PART}"
-        then
-            die \
-                "failed to load nbd; install linux-modules-extra or enable CONFIG_BLK_DEV_NBD"
-        fi
-    fi
-
-    if ! command -v nbd-client >/dev/null 2>&1; then
-        die \
-            "nbd-client is not installed; install the nbd-client package"
-    fi
-}
-
 nbd_device_ready() {
     [[ -b "$NBD_DEV" ]] || return 1
 
@@ -262,6 +235,40 @@ detect_partition() {
         printf '%s\n' "${NBD_DEV}p1"
     else
         printf '%s\n' "$NBD_DEV"
+    fi
+}
+
+###############################################################################
+# NBD module load
+###############################################################################
+
+prepare_nbd_module() {
+    need_root
+
+    if [[ ! -b /dev/nbd0 ]]; then
+        info "loading nbd module (nbds_max=${NBD_MODULE_NBDS_MAX}, max_part=${NBD_MODULE_MAX_PART})"
+
+        if ! modprobe nbd \
+            nbds_max="${NBD_MODULE_NBDS_MAX}" \
+            max_part="${NBD_MODULE_MAX_PART}"
+        then
+            die \
+                "failed to load nbd; install linux-modules-extra or enable CONFIG_BLK_DEV_NBD"
+        fi
+
+        # Give udev a moment to create the node.
+        for _ in {1..20}; do
+            [[ -b /dev/nbd0 ]] && break
+            sleep 0.05
+        done
+
+        [[ -b /dev/nbd0 ]] ||
+            die "nbd module loaded but /dev/nbd0 did not appear"
+    fi
+
+    if ! command -v nbd-client >/dev/null 2>&1; then
+        die \
+            "nbd-client is not installed; install the nbd-client package"
     fi
 }
 
@@ -483,6 +490,27 @@ prepare_fakedisk() {
 }
 
 ###############################################################################
+# libcomposite / ConfigFS
+###############################################################################
+
+prepare_gadget() {
+    need_root
+
+    info "loading libcomposite"
+    modprobe libcomposite
+
+    ensure_configfs
+
+    echo
+    echo "libcomposite prepared:"
+    echo "  module:   loaded"
+    echo "  configfs: mounted at $CONFIGFS"
+    echo
+    echo "note: gadget descriptors, functions, and UDC bind are configured"
+    echo "      by tssniff.  see prepare-tssniff / start."
+}
+
+###############################################################################
 # tssniff
 ###############################################################################
 
@@ -551,9 +579,9 @@ prepare_tssniff() {
     ###########################################################################
     # Start.
     #
-    # tssniff owns the NBD server and the nbd-client attachment.  The USB
-    # gadget is handled by this script (prepare-gadget), so we pass
-    # -no-gadget to keep the two responsibilities separate.
+    # tssniff owns the NBD server, the nbd-client attachment, and the USB
+    # gadget configuration (descriptors, functions, UDC bind).  This script
+    # only ensures libcomposite is loaded before tssniff starts.
     ###########################################################################
 
     info "starting tssniff"
@@ -563,7 +591,6 @@ prepare_tssniff() {
         -listen "$TSSNIFF_LISTEN"
         -fs "$TSSNIFF_FILESYSTEM"
         -nbd "$NBD_DEV"
-        -no-gadget
     )
 
     if [[ -n "$TSSNIFF_VERBOSE" ]]; then
@@ -639,7 +666,7 @@ stop_tssniff() {
     fi
 
     ###########################################################################
-    # Kill tssniff.
+    # Kill tssniff.  tssniff removes its own USB gadget on shutdown.
     ###########################################################################
 
     if [[ ! -f "$TSSNIFF_PIDFILE" ]]; then
@@ -780,320 +807,6 @@ find_udc() {
     printf '%s\n' "${udcs[@]}"
 }
 
-select_udc() {
-    if [[ -n "$UDC" ]]; then
-        [[ -d "/sys/class/udc/$UDC" ]] ||
-            die "specified UDC does not exist: $UDC"
-
-        return
-    fi
-
-    local -a udcs=()
-
-    while IFS= read -r path; do
-        udcs+=("$(basename "$path")")
-    done < <(
-        find /sys/class/udc \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type l \
-            2>/dev/null |
-        sort
-    )
-
-    if (( ${#udcs[@]} == 0 )); then
-        die \
-            "no UDC found; this USB controller is not exposed as a gadget/peripheral controller"
-    fi
-
-    if (( ${#udcs[@]} > 1 )); then
-        warn "multiple UDCs found:"
-        printf '    %s\n' "${udcs[@]}"
-        warn "using first: ${udcs[0]}"
-        warn "override with UDC=<name>"
-    fi
-
-    UDC="${udcs[0]}"
-}
-
-###############################################################################
-# NBD module load
-###############################################################################
-prepare_nbd_module() {
-    need_root
-
-    if [[ ! -b /dev/nbd0 ]]; then
-        info "loading nbd module (nbds_max=${NBD_MODULE_NBDS_MAX}, max_part=${NBD_MODULE_MAX_PART})"
-
-        if ! modprobe nbd \
-            nbds_max="${NBD_MODULE_NBDS_MAX}" \
-            max_part="${NBD_MODULE_MAX_PART}"
-        then
-            die \
-                "failed to load nbd; install linux-modules-extra or enable CONFIG_BLK_DEV_NBD"
-        fi
-
-        # Give udev a moment to create the node.
-        for _ in {1..20}; do
-            [[ -b /dev/nbd0 ]] && break
-            sleep 0.05
-        done
-
-        [[ -b /dev/nbd0 ]] ||
-            die "nbd module loaded but /dev/nbd0 did not appear"
-    fi
-
-    if ! command -v nbd-client >/dev/null 2>&1; then
-        die \
-            "nbd-client is not installed; install the nbd-client package"
-    fi
-}
-
-###############################################################################
-# Gadget ConfigFS
-###############################################################################
-
-prepare_gadget() {
-    need_root
-
-    modprobe libcomposite
-    ensure_configfs
-
-    nbd_device_ready ||
-        die \
-            "NBD device is not ready: $NBD_DEV
-Run: $0 prepare-tssniff"
-
-    if [[ -d "$GADGET" ]]; then
-        local current=""
-
-        if [[ -f "$GADGET/UDC" ]]; then
-            current="$(cat "$GADGET/UDC" 2>/dev/null || true)"
-        fi
-
-        if [[ -n "$current" ]]; then
-            die \
-                "gadget is already bound to UDC: $current"
-        fi
-
-        warn "stale unbound gadget found; removing it"
-
-        remove_gadget
-    fi
-
-    info "creating ConfigFS gadget: $GADGET_NAME"
-
-    mkdir -p "$GADGET"
-
-    ###########################################################################
-    # Device descriptor
-    ###########################################################################
-
-    write_attr "$VID" \
-        "$GADGET/idVendor"
-
-    write_attr "$PID" \
-        "$GADGET/idProduct"
-
-    write_attr "$BCD_USB" \
-        "$GADGET/bcdUSB"
-
-    write_attr "$BCD_DEVICE" \
-        "$GADGET/bcdDevice"
-
-    ###########################################################################
-    # Strings
-    ###########################################################################
-
-    mkdir -p \
-        "$GADGET/strings/0x409"
-
-    write_attr "$SERIAL" \
-        "$GADGET/strings/0x409/serialnumber"
-
-    write_attr "$MANUFACTURER" \
-        "$GADGET/strings/0x409/manufacturer"
-
-    write_attr "$PRODUCT" \
-        "$GADGET/strings/0x409/product"
-
-    ###########################################################################
-    # Configuration
-    ###########################################################################
-
-    mkdir -p \
-        "$GADGET/configs/c.1/strings/0x409"
-
-    write_attr "$CONFIGURATION" \
-        "$GADGET/configs/c.1/strings/0x409/configuration"
-
-    # Self-powered.
-    write_attr "0xC0" \
-        "$GADGET/configs/c.1/bmAttributes"
-
-    write_attr "$MAX_POWER" \
-        "$GADGET/configs/c.1/MaxPower"
-
-    ###########################################################################
-    # Mass Storage
-    ###########################################################################
-
-    mkdir -p \
-        "$GADGET/functions/mass_storage.0"
-
-    write_attr "$NBD_DEV" \
-        "$GADGET/functions/mass_storage.0/lun.0/file"
-
-    write_attr "1" \
-        "$GADGET/functions/mass_storage.0/lun.0/removable"
-
-    write_attr "0" \
-        "$GADGET/functions/mass_storage.0/lun.0/ro"
-
-    ###########################################################################
-    # Add MSC function
-    ###########################################################################
-
-    ln -s \
-        "$GADGET/functions/mass_storage.0" \
-        "$GADGET/configs/c.1/mass_storage.0"
-
-    echo
-    echo "gadget prepared but NOT bound:"
-    echo
-    echo "  gadget:        $GADGET_NAME"
-    echo "  backing:       $NBD_DEV"
-    echo "  size:          $(nbd_device_size) bytes"
-    echo "  filesystem:    $FILESYSTEM"
-    echo
-    echo "  VID:           $VID"
-    echo "  PID:           $PID"
-    echo "  USB:           $BCD_USB"
-    echo "  device:        $BCD_DEVICE"
-    echo
-    echo "  manufacturer:  $MANUFACTURER"
-    echo "  product:       $PRODUCT"
-    echo "  serial:        $SERIAL"
-    echo "  configuration: $CONFIGURATION"
-}
-
-###############################################################################
-# Bind
-###############################################################################
-
-bind_gadget() {
-    need_root
-
-    [[ -d "$GADGET" ]] ||
-        die \
-            "gadget has not been prepared; run prepare-gadget first"
-
-    select_udc
-
-    local current=""
-
-    if [[ -f "$GADGET/UDC" ]]; then
-        current="$(cat "$GADGET/UDC" 2>/dev/null || true)"
-    fi
-
-    if [[ -n "$current" ]]; then
-        echo "gadget already bound to: $current"
-        return
-    fi
-
-    info "binding $GADGET_NAME to UDC: $UDC"
-
-    write_attr "$UDC" \
-        "$GADGET/UDC"
-
-    echo
-    echo "========================================"
-    echo " USB GADGET ACTIVE"
-    echo "========================================"
-    echo
-    echo "  Gadget:     $GADGET_NAME"
-    echo "  UDC:        $UDC"
-    echo "  Backing:    $NBD_DEV"
-    echo "  Size:       $(nbd_device_size) bytes"
-    echo "  Filesystem: $FILESYSTEM"
-    echo "  VID:        $VID"
-    echo "  PID:        $PID"
-    echo
-}
-
-###############################################################################
-# Remove gadget
-###############################################################################
-
-remove_gadget() {
-    [[ -d "$GADGET" ]] || return 0
-
-    ###########################################################################
-    # Unbind.
-    ###########################################################################
-
-    if [[ -f "$GADGET/UDC" ]]; then
-        local current=""
-
-        current="$(cat "$GADGET/UDC" 2>/dev/null || true)"
-
-        if [[ -n "$current" ]]; then
-            info "unbinding UDC: $current"
-
-            write_attr "" \
-                "$GADGET/UDC"
-        fi
-    fi
-
-    ###########################################################################
-    # Remove MSC from configuration.
-    ###########################################################################
-
-    rm -f \
-        "$GADGET/configs/c.1/mass_storage.0" \
-        2>/dev/null || true
-
-    ###########################################################################
-    # Remove MSC function.
-    ###########################################################################
-
-    rmdir \
-        "$GADGET/functions/mass_storage.0" \
-        2>/dev/null || true
-
-    ###########################################################################
-    # Remove configuration strings.
-    ###########################################################################
-
-    rmdir \
-        "$GADGET/configs/c.1/strings/0x409" \
-        2>/dev/null || true
-
-    ###########################################################################
-    # Remove configuration.
-    ###########################################################################
-
-    rmdir \
-        "$GADGET/configs/c.1" \
-        2>/dev/null || true
-
-    ###########################################################################
-    # Remove device strings.
-    ###########################################################################
-
-    rmdir \
-        "$GADGET/strings/0x409" \
-        2>/dev/null || true
-
-    ###########################################################################
-    # Remove gadget.
-    ###########################################################################
-
-    rmdir \
-        "$GADGET" \
-        2>/dev/null || true
-}
-
 ###############################################################################
 # Start
 ###############################################################################
@@ -1101,35 +814,23 @@ remove_gadget() {
 start_gadget() {
     need_root
 
-    info "STEP 1/5: prepare fake disk"
+    info "STEP 1/4: prepare fake disk"
     prepare_fakedisk
 
     echo
 
-    info "STEP 2/5: check nbd module"
+    info "STEP 2/4: check nbd module"
     prepare_nbd_module
 
     echo
 
-    info "STEP 3/5: start tssniff"
-    prepare_tssniff
-
-    echo
-
-    info "STEP 4/5: prepare gadget"
+    info "STEP 3/4: prepare libcomposite"
     prepare_gadget
 
     echo
 
-    info "STEP 4/5: find UDC"
-    select_udc
-
-    echo "  selected UDC: $UDC"
-
-    echo
-
-    info "binding gadget"
-    bind_gadget
+    info "STEP 4/4: start tssniff (configures gadget itself)"
+    prepare_tssniff
 }
 
 ###############################################################################
@@ -1138,16 +839,6 @@ start_gadget() {
 
 stop_gadget() {
     need_root
-
-    if [[ -d "$GADGET" ]]; then
-        info "stopping gadget"
-        remove_gadget
-        echo "gadget stopped"
-    else
-        echo "gadget is not present"
-    fi
-
-    echo
 
     stop_tssniff
 }
@@ -1273,10 +964,10 @@ status_gadget() {
     echo
 
     ###########################################################################
-    # Gadget
+    # Gadget (configured by tssniff)
     ###########################################################################
 
-    echo "=== Gadget ==="
+    echo "=== Gadget (owned by tssniff) ==="
 
     if [[ ! -d "$GADGET" ]]; then
         echo "  inactive"
@@ -1346,19 +1037,8 @@ Environment:
   DISK_SIZE=1T
   PARTITION_START_LBA=2048
 
+  GADGET_NAME=guoxin
   UDC=<udc-name>
-
-  VID=0x1d6b
-  PID=0x0104
-
-  BCD_USB=0x0200
-  BCD_DEVICE=0x0100
-
-  SERIAL=GUOXIN-TS-0001
-  MANUFACTURER="Yonle Lab"
-  PRODUCT="USB Mass Storage"
-  CONFIGURATION="Mass Storage"
-  MAX_POWER=250
 
 Examples:
 
