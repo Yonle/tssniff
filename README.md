@@ -23,7 +23,8 @@ normal writes    *.ts writes
 storage        interception
                     │
                     ▼
-                 TCP :6969
+              HTTP streaming
+                 /stream
 ```
 
 The fake disk is a complete disk image containing an MBR partition table and a FAT32 partition by default.
@@ -45,8 +46,14 @@ Options:
 | --------- | --------------------- |
 | `-image`  | Backing disk image    |
 | `-mount`  | FUSE mount point      |
-| `-listen` | TCP listen address    |
+| `-listen` | HTTP listen address   |
 | `-debug`  | Enable FUSE debugging |
+
+The intercepted MPEG-TS stream is available through the HTTP streaming endpoint:
+
+```text
+http://<host>:6969/stream
+```
 
 ## Disk layout
 
@@ -97,15 +104,29 @@ The filesystem layer tracks directory entries, file metadata, and file data rang
 
 Filesystem handling is separated from partition detection, allowing additional filesystem implementations to be added later.
 
-## TS interception
+## TS interception and HTTP streaming
 
 `tssniff` tracks the filesystem and associates file data ranges with filenames.
 
-Writes to `.ts` files are intercepted and forwarded to connected TCP clients.
+Writes to `.ts` files are intercepted and made available through an HTTP streaming server.
+
+The MPEG-TS stream can be accessed at:
+
+```text
+/stream
+```
+
+For example:
+
+```text
+http://192.168.100.1:6969/stream
+```
+
+Clients can consume the stream directly using software such as `ffmpeg`, `mpv`, or other HTTP-compatible MPEG-TS players.
 
 Writes whose purpose cannot yet be determined may be temporarily quarantined. Filesystem metadata changes trigger a rescan, allowing newly-created files to be identified and their pending writes replayed through the appropriate path.
 
-A slow TCP client is disconnected rather than blocking storage I/O.
+A slow HTTP client is disconnected rather than blocking storage I/O.
 
 ## `gadget.sh`
 
@@ -175,8 +196,28 @@ USB Mass Storage
     └── fake disk image
 ```
 
+## HTTP server
+
+`tssniff` runs an HTTP server on the address specified by `-listen`.
+
+The MPEG-TS streaming endpoint is:
+
+```text
+GET /stream
+```
+
+Example:
+
+```sh
+ffmpeg -i http://127.0.0.1:6969/stream ...
+```
+
+The HTTP server is independent of the USB Mass Storage gadget itself; the gadget provides the fake storage interface while the HTTP server provides access to intercepted MPEG-TS data.
+
 ## Status
 
 `tssniff` is experimental software for faking USB storage media and intercepting MPEG-TS file writes on Linux.
 
 FAT32 is currently the default filesystem for generated fake disks, with exFAT available as an alternative.
+
+The intercepted MPEG-TS data is exposed through the HTTP `/stream` endpoint.
