@@ -10,7 +10,8 @@ import (
 )
 
 type Hub struct {
-	cmd chan hubCommand
+	cmd         chan hubCommand
+	clientCount int32 // Atomic counter to eliminate allocations when no clients exist
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -18,10 +19,10 @@ type Hub struct {
 }
 
 type hubCommand struct {
-	op     hubOp
-	client *Client
-	parts  [][]byte
-	done   chan struct{}
+	op      hubOp
+	client  *Client
+	payload *sharedPayload
+	done    chan struct{}
 }
 
 type hubOp uint8
@@ -35,7 +36,7 @@ const (
 type Client struct {
 	remoteAddr string
 	q          chan *sharedPayload
-	slowCount  int // Consecutive full-buffer counter before hard drop
+	slowCount  int
 }
 
 type sharedPayload struct {
@@ -74,7 +75,7 @@ func (p *sharedPayload) release() {
 
 func NewHub() *Hub {
 	h := &Hub{
-		cmd:  make(chan hubCommand, 512), // Increased command queue size
+		cmd:  make(chan hubCommand, 512),
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
@@ -93,12 +94,14 @@ func (h *Hub) run() {
 			for client := range clients {
 				h.closeClient(client)
 			}
+			atomic.StoreInt32(&h.clientCount, 0)
 			return
 
 		case cmd := <-h.cmd:
 			switch cmd.op {
 			case hubAdd:
 				clients[cmd.client] = struct{}{}
+				atomic.StoreInt32(&h.clientCount, int32(len(clients)))
 
 				log.Printf(
 					"TS HTTP client connected: %s (%d clients)",
@@ -116,6 +119,7 @@ func (h *Hub) run() {
 
 				delete(clients, cmd.client)
 				h.closeClient(cmd.client)
+				atomic.StoreInt32(&h.clientCount, int32(len(clients)))
 
 				log.Printf(
 					"TS HTTP client disconnected: %s (%d clients)",
@@ -125,28 +129,27 @@ func (h *Hub) run() {
 
 			case hubBroadcast:
 				if len(clients) == 0 {
+					cmd.payload.release()
 					break
 				}
 
-				p := newSharedPayload(cmd.parts)
+				p := cmd.payload
 
 				for client := range clients {
 					p.retain()
 
 					select {
 					case client.q <- p:
-						// Reset slow counter on successful enqueue
 						client.slowCount = 0
 
 					default:
-						// Queue full: client is lagging behind
 						p.release()
 						client.slowCount++
 
-						// Only drop after 10 consecutive full-buffer ticks
 						if client.slowCount >= 10 {
 							delete(clients, client)
 							h.closeClient(client)
+							atomic.StoreInt32(&h.clientCount, int32(len(clients)))
 
 							log.Printf(
 								"TS HTTP client dropped: %s (slow, %d clients remaining)",
@@ -199,7 +202,7 @@ func (h *Hub) Serve(addr string) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
-		WriteTimeout:      0, // Disabled for continuous video streaming
+		WriteTimeout:      0,
 	}
 
 	go func() {
@@ -243,7 +246,6 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 
-	// Increased queue capacity from 256 to 1024
 	client := &Client{
 		remoteAddr: r.RemoteAddr,
 		q:          make(chan *sharedPayload, 1024),
@@ -291,12 +293,10 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Write primary payload
 			if err := writeAndRelease(payload); err != nil {
 				return
 			}
 
-			// Batch drain: write any additional pending payloads before flushing
 		drainLoop:
 			for {
 				select {
@@ -313,7 +313,6 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Flush once per batch
 			flusher.Flush()
 		}
 	}
@@ -327,18 +326,33 @@ func (h *Hub) closeClient(client *Client) {
 	}
 }
 
-// BroadcastBatch submits broadcast payloads asynchronously without blocking FUSE
+// BroadcastBatch captures the kernel buffer synchronously before returning to FUSE
 func (h *Hub) BroadcastBatch(parts [][]byte) {
 	if len(parts) == 0 {
 		return
 	}
 
-	// Submit without waiting on a done channel to prevent FUSE stall
-	_ = h.submit(hubCommand{
-		op:    hubBroadcast,
-		parts: parts,
-		done:  nil,
-	})
+	// Zero-allocation shortcut: if no clients are connected, exit instantly
+	if atomic.LoadInt32(&h.clientCount) == 0 {
+		return
+	}
+
+	// Copy data synchronously ON the FUSE thread while parts is guaranteed valid
+	p := newSharedPayload(parts)
+
+	cmd := hubCommand{
+		op:      hubBroadcast,
+		payload: p,
+	}
+
+	select {
+	case h.cmd <- cmd:
+		// Queued successfully
+	default:
+		// Queue backed up: drop payload and release memory to protect FUSE
+		p.release()
+		log.Printf("TS HTTP hub queue full, dropping broadcast payload")
+	}
 }
 
 func (h *Hub) Close() {
