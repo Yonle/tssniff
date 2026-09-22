@@ -1,121 +1,94 @@
 package main
 
 import (
-	"sort"
-	"sync/atomic"
+	"encoding/binary"
+	"io"
 )
 
-type Tracker interface {
-	Classify(start, length uint64) []ByteRange
-	TSRanges() []ByteRange
-	Refresh() error
+type FSTracker struct {
+	fsType      string
+	partition   Partition
+	metadataEnd uint64
+	bytesPerSec uint32
 }
 
-type RangeKind uint8
-
-const (
-	RangeMeta RangeKind = iota
-	RangeNormal
-	RangeTS
-	RangeUnknown
-)
-
-type ByteRange struct {
-	Start uint64
-	End   uint64 // exclusive
-
-	Kind RangeKind
-	Name string
+func NewFSTracker(fsType string, part Partition, r io.ReaderAt) *FSTracker {
+	tracker := &FSTracker{
+		fsType:    fsType,
+		partition: part,
+	}
+	tracker.initMetadataBoundaries(r)
+	return tracker
 }
 
-type trackerSnapshot struct {
-	meta       []ByteRange
-	ts         []ByteRange
-	classified []ByteRange
-}
+func (t *FSTracker) initMetadataBoundaries(r io.ReaderAt) {
+	if t.partition.Size == 0 {
+		// No partition info; be conservative.
+		t.metadataEnd = 2 * 1024 * 1024
+		return
+	}
 
-type rangeStore struct {
-	state atomic.Pointer[trackerSnapshot]
-}
+	var boot [512]byte
+	if _, err := r.ReadAt(boot[:], t.partition.Offset); err != nil {
+		t.metadataEnd = uint64(t.partition.Offset) + (2 * 1024 * 1024)
+		return
+	}
 
-func newRangeStore() *rangeStore {
-	s := &rangeStore{}
-	s.state.Store(&trackerSnapshot{})
-	return s
-}
+	// Require the classic boot signature (0x55 0xAA at offset 510).
+	// Without this we cannot trust the FAT size fields.
+	if boot[510] != 0x55 || boot[511] != 0xAA {
+		t.metadataEnd = uint64(t.partition.Offset) + (2 * 1024 * 1024)
+		return
+	}
 
-func (s *rangeStore) set(meta, rules []ByteRange) {
-	ts := make([]ByteRange, 0, 4)
-	for _, r := range rules {
-		if r.Kind == RangeTS {
-			ts = append(ts, r)
+	t.bytesPerSec = uint32(binary.LittleEndian.Uint16(boot[11:13]))
+	if t.bytesPerSec == 0 {
+		t.bytesPerSec = 512
+	}
+
+	reservedSectors := uint32(binary.LittleEndian.Uint16(boot[14:16]))
+	numFATs := uint32(boot[16])
+	fatSize := uint32(binary.LittleEndian.Uint32(boot[36:40]))
+
+	partitionSectors := uint64(t.partition.Size) / uint64(t.bytesPerSec)
+
+	var metaSectors uint64
+
+	if fatSize > 0 && numFATs > 0 {
+		// FAT32.  Trust the boot sector's FATSz32.
+		metaSectors = uint64(reservedSectors) +
+			uint64(numFATs)*uint64(fatSize) +
+			32 // root dir clusters
+
+		if metaSectors > partitionSectors {
+			metaSectors = partitionSectors
 		}
+	} else {
+		// exFAT or unknown: fall back to a fixed 4 MB window.
+		metaSectors = (4 * 1024 * 1024) / uint64(t.bytesPerSec)
 	}
 
-	s.state.Store(&trackerSnapshot{
-		meta:       meta,
-		ts:         ts,
-		classified: buildClassification(meta, rules),
-	})
+	t.metadataEnd = uint64(t.partition.Offset) + metaSectors*uint64(t.bytesPerSec)
+
+	// Metadata can never extend past the partition.
+	partitionEnd := uint64(t.partition.Offset) + uint64(t.partition.Size)
+	if t.metadataEnd > partitionEnd {
+		t.metadataEnd = partitionEnd
+	}
 }
 
-func (s *rangeStore) Classify(start, length uint64) []ByteRange {
-	if length == 0 {
-		return nil
+func (t *FSTracker) IsMetadata(off uint64, size uint32) bool {
+	if off < 512 {
+		return true
 	}
-
-	end := start + length
-	ranges := s.state.Load().classified
-	out := make([]ByteRange, 0, 4)
-
-	i := sort.Search(len(ranges), func(i int) bool {
-		return ranges[i].End > start
-	})
-
-	pos := start
-	for i < len(ranges) && pos < end {
-		r := ranges[i]
-
-		if r.Start > pos {
-			gapEnd := minU64(r.Start, end)
-			out = append(out, ByteRange{
-				Start: pos,
-				End:   gapEnd,
-				Kind:  RangeUnknown,
-			})
-			pos = gapEnd
-			if pos == end {
-				break
-			}
-		}
-
-		if r.End <= pos {
-			i++
-			continue
-		}
-
-		b := minU64(r.End, end)
-		out = append(out, ByteRange{
-			Start: pos,
-			End:   b,
-			Kind:  r.Kind,
-			Name:  r.Name,
-		})
-		pos = b
-		i++
+	if off >= uint64(t.partition.Offset) && off < t.metadataEnd {
+		return true
 	}
-
-	if pos < end {
-		out = append(out, ByteRange{
-			Start: pos,
-			End:   end,
-			Kind:  RangeUnknown,
-		})
-	}
-
-	return out
+	return false
 }
 
-func (s *rangeStore) TSRanges() []ByteRange {
-	return s.state.Load().ts
+// MetadataEnd returns the byte offset where metadata ends. Exposed for
+// diagnostics.
+func (t *FSTracker) MetadataEnd() uint64 {
+	return t.metadataEnd
 }

@@ -1,364 +1,78 @@
+// hub.go
 package main
 
 import (
-	"errors"
-	"log"
-	"net/http"
+	"context"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-type Hub struct {
-	cmd         chan hubCommand
-	clientCount int32 // Atomic counter to eliminate allocations when no clients exist
-
-	stopOnce sync.Once
-	stop     chan struct{}
-	done     chan struct{}
-}
-
-type hubCommand struct {
-	op      hubOp
-	client  *Client
-	payload *sharedPayload
-	done    chan struct{}
-}
-
-type hubOp uint8
-
-const (
-	hubAdd hubOp = iota
-	hubRemove
-	hubBroadcast
-)
+const clientQueueDepth = 64
 
 type Client struct {
-	remoteAddr string
-	q          chan *sharedPayload
-	slowCount  int
+	ch chan []byte
 }
 
-type sharedPayload struct {
-	data []byte
-	refs atomic.Int32
-}
+// Ch exposes the receive side of the client channel.
+func (c *Client) Ch() <-chan []byte { return c.ch }
 
-func newSharedPayload(parts [][]byte) *sharedPayload {
-	size := 0
-	for _, part := range parts {
-		size += len(part)
-	}
-
-	p := &sharedPayload{
-		data: acquirePayload(size),
-	}
-	p.refs.Store(1)
-
-	n := 0
-	for _, part := range parts {
-		n += copy(p.data[n:], part)
-	}
-
-	return p
-}
-
-func (p *sharedPayload) retain() {
-	p.refs.Add(1)
-}
-
-func (p *sharedPayload) release() {
-	if p.refs.Add(-1) == 0 {
-		releasePayload(p.data)
-	}
+type Hub struct {
+	clients map[*Client]struct{}
+	mu      sync.RWMutex
 }
 
 func NewHub() *Hub {
-	h := &Hub{
-		cmd:  make(chan hubCommand, 512),
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-	}
-	go h.run()
-	return h
+	return &Hub{clients: make(map[*Client]struct{})}
 }
 
-func (h *Hub) run() {
-	clients := make(map[*Client]struct{})
-
-	defer close(h.done)
-
-	for {
-		select {
-		case <-h.stop:
-			for client := range clients {
-				h.closeClient(client)
-			}
-			atomic.StoreInt32(&h.clientCount, 0)
-			return
-
-		case cmd := <-h.cmd:
-			switch cmd.op {
-			case hubAdd:
-				clients[cmd.client] = struct{}{}
-				atomic.StoreInt32(&h.clientCount, int32(len(clients)))
-
-				log.Printf(
-					"TS HTTP client connected: %s (%d clients)",
-					cmd.client.remoteAddr,
-					len(clients),
-				)
-
-			case hubRemove:
-				if _, ok := clients[cmd.client]; !ok {
-					if cmd.done != nil {
-						close(cmd.done)
-					}
-					continue
-				}
-
-				delete(clients, cmd.client)
-				h.closeClient(cmd.client)
-				atomic.StoreInt32(&h.clientCount, int32(len(clients)))
-
-				log.Printf(
-					"TS HTTP client disconnected: %s (%d clients)",
-					cmd.client.remoteAddr,
-					len(clients),
-				)
-
-			case hubBroadcast:
-				if len(clients) == 0 {
-					cmd.payload.release()
-					break
-				}
-
-				p := cmd.payload
-
-				for client := range clients {
-					p.retain()
-
-					select {
-					case client.q <- p:
-						client.slowCount = 0
-
-					default:
-						p.release()
-						client.slowCount++
-
-						if client.slowCount >= 10 {
-							delete(clients, client)
-							h.closeClient(client)
-							atomic.StoreInt32(&h.clientCount, int32(len(clients)))
-
-							log.Printf(
-								"TS HTTP client dropped: %s (slow, %d clients remaining)",
-								client.remoteAddr,
-								len(clients),
-							)
-						}
-					}
-				}
-
-				p.release()
-			}
-
-			if cmd.done != nil {
-				close(cmd.done)
-			}
-		}
-	}
-}
-
-func (h *Hub) submit(cmd hubCommand) bool {
-	select {
-	case h.cmd <- cmd:
-	case <-h.stop:
-		return false
-	case <-h.done:
-		return false
-	}
-
-	if cmd.done == nil {
-		return true
-	}
-
-	select {
-	case <-cmd.done:
-		return true
-	case <-h.stop:
-		return false
-	case <-h.done:
-		return false
-	}
-}
-
-func (h *Hub) Serve(addr string) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", h.handleStream)
-
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		WriteTimeout:      0,
-	}
+func (h *Hub) Register(ctx context.Context) *Client {
+	c := &Client{ch: make(chan []byte, clientQueueDepth)}
+	h.mu.Lock()
+	h.clients[c] = struct{}{}
+	h.mu.Unlock()
 
 	go func() {
-		<-h.stop
-		_ = server.Close()
+		<-ctx.Done()
+		h.unregister(c)
 	}()
-
-	log.Printf("TS HTTP server listening on http://%s/stream", addr)
-
-	err := server.ListenAndServe()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-
-	return err
+	return c
 }
 
-func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(
-			w,
-			http.StatusText(http.StatusMethodNotAllowed),
-			http.StatusMethodNotAllowed,
-		)
-		return
+// Unregister removes c from the hub immediately.  Safe to call multiple times.
+func (h *Hub) Unregister(c *Client) {
+	h.unregister(c)
+}
+
+func (h *Hub) unregister(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.clients[c]; exists {
+		delete(h.clients, c)
+		close(c.ch)
 	}
+}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(
-			w,
-			"streaming unsupported",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	w.Header().Set("Content-Type", "video/mp2t")
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-
-	client := &Client{
-		remoteAddr: r.RemoteAddr,
-		q:          make(chan *sharedPayload, 1024),
-	}
-
-	addDone := make(chan struct{})
-	if !h.submit(hubCommand{
-		op:     hubAdd,
-		client: client,
-		done:   addDone,
-	}) {
-		http.Error(
-			w,
-			"stream server shutting down",
-			http.StatusServiceUnavailable,
-		)
-		return
-	}
-
-	defer func() {
-		removeDone := make(chan struct{})
-
-		_ = h.submit(hubCommand{
-			op:     hubRemove,
-			client: client,
-			done:   removeDone,
-		})
-	}()
-
-	flusher.Flush()
-
-	writeAndRelease := func(p *sharedPayload) error {
-		_, err := w.Write(p.data)
-		p.release()
-		return err
-	}
-
-	for {
+func (h *Hub) Broadcast(data []byte) {
+	h.mu.RLock()
+	var slow []*Client
+	for c := range h.clients {
 		select {
-		case <-r.Context().Done():
-			return
-
-		case payload, ok := <-client.q:
-			if !ok {
-				return
-			}
-
-			if err := writeAndRelease(payload); err != nil {
-				return
-			}
-
-		drainLoop:
-			for {
-				select {
-				case p, ok := <-client.q:
-					if !ok {
-						flusher.Flush()
-						return
-					}
-					if err := writeAndRelease(p); err != nil {
-						return
-					}
-				default:
-					break drainLoop
-				}
-			}
-
-			flusher.Flush()
+		case c.ch <- data:
+		default:
+			slow = append(slow, c)
 		}
 	}
-}
+	h.mu.RUnlock()
 
-func (h *Hub) closeClient(client *Client) {
-	close(client.q)
-
-	for payload := range client.q {
-		payload.release()
-	}
-}
-
-// BroadcastBatch captures the kernel buffer synchronously before returning to FUSE
-func (h *Hub) BroadcastBatch(parts [][]byte) {
-	if len(parts) == 0 {
+	if len(slow) == 0 {
 		return
 	}
 
-	// Zero-allocation shortcut: if no clients are connected, exit instantly
-	if atomic.LoadInt32(&h.clientCount) == 0 {
-		return
+	h.mu.Lock()
+	for _, c := range slow {
+		if _, exists := h.clients[c]; exists {
+			delete(h.clients, c)
+			close(c.ch)
+		}
 	}
-
-	// Copy data synchronously ON the FUSE thread while parts is guaranteed valid
-	p := newSharedPayload(parts)
-
-	cmd := hubCommand{
-		op:      hubBroadcast,
-		payload: p,
-	}
-
-	select {
-	case h.cmd <- cmd:
-		// Queued successfully
-	default:
-		// Queue backed up: drop payload and release memory to protect FUSE
-		p.release()
-		log.Printf("TS HTTP hub queue full, dropping broadcast payload")
-	}
-}
-
-func (h *Hub) Close() {
-	h.stopOnce.Do(func() {
-		close(h.stop)
-	})
-
-	<-h.done
+	h.mu.Unlock()
 }

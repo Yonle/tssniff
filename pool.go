@@ -19,7 +19,6 @@ func acquirePayload(size int) []byte {
 	buf := payloadPool.Get().([]byte)
 
 	if cap(buf) < size {
-		payloadPool.Put(buf[:0])
 		return make([]byte, size)
 	}
 

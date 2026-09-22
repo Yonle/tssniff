@@ -32,16 +32,10 @@ var mbrFilesystems = map[string]mbrFilesystem{
 	},
 }
 
-func findMBRPartition(
-	f *os.File,
-	filesystem string,
-) (Partition, error) {
+func findMBRPartition(f *os.File, filesystem string) (Partition, error) {
 	fs, ok := mbrFilesystems[filesystem]
 	if !ok {
-		return Partition{}, fmt.Errorf(
-			"unsupported filesystem %q",
-			filesystem,
-		)
+		return Partition{}, fmt.Errorf("unsupported filesystem %q", filesystem)
 	}
 
 	var mbr [sectorSize]byte
@@ -75,8 +69,7 @@ func findMBRPartition(
 		}
 
 		end := fs.signatureAt + len(fs.signature)
-		if end > len(boot) ||
-			string(boot[fs.signatureAt:end]) != fs.signature {
+		if end > len(boot) || string(boot[fs.signatureAt:end]) != fs.signature {
 			continue
 		}
 
@@ -87,8 +80,5 @@ func findMBRPartition(
 		}, nil
 	}
 
-	return Partition{}, fmt.Errorf(
-		"no %s partition found in MBR",
-		filesystem,
-	)
+	return Partition{}, fmt.Errorf("no %s partition found in MBR", filesystem)
 }

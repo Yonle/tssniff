@@ -48,42 +48,6 @@ func isTSFile(name string) bool {
 		strings.HasSuffix(name, ".trp")
 }
 
-func findMPEGTSOffset(data []byte) (int, bool) {
-	if len(data) < packetSize*minPackets {
-		return 0, false
-	}
-
-	for start := 0; start < packetSize; start++ {
-		if data[start] != 0x47 {
-			continue
-		}
-
-		packets := 0
-
-		for off := start; off+packetSize <= len(data); off += packetSize {
-			if data[off] != 0x47 {
-				break
-			}
-
-			/*
-				Adaptation-field control 00 is reserved,
-				so this is a cheap sanity check.
-			*/
-			if data[off+3]&0x30 == 0 {
-				break
-			}
-
-			packets++
-		}
-
-		if packets >= minPackets {
-			return start, true
-		}
-	}
-
-	return 0, false
-}
-
 func toErrno(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -126,6 +90,16 @@ func coalesceRanges(in []ByteRange) []ByteRange {
 	return out
 }
 
+func findMatchingRange(ranges []ByteRange, a, b uint64) (ByteRange, bool) {
+	idx := sort.Search(len(ranges), func(i int) bool {
+		return ranges[i].End > a
+	})
+	if idx < len(ranges) && ranges[idx].Start <= a && b <= ranges[idx].End {
+		return ranges[idx], true
+	}
+	return ByteRange{}, false
+}
+
 func buildClassification(meta, rules []ByteRange) []ByteRange {
 	if len(meta) == 0 && len(rules) == 0 {
 		return nil
@@ -143,9 +117,7 @@ func buildClassification(meta, rules []ByteRange) []ByteRange {
 		}
 	}
 
-	sort.Slice(bounds, func(i, j int) bool {
-		return bounds[i] < bounds[j]
-	})
+	sort.Slice(bounds, func(i, j int) bool { return bounds[i] < bounds[j] })
 
 	uniq := bounds[:0]
 	for _, b := range bounds {
@@ -161,32 +133,16 @@ func buildClassification(meta, rules []ByteRange) []ByteRange {
 			continue
 		}
 
-		kind := RangeUnknown
-		name := ""
-
-		for _, r := range meta {
-			if r.Start <= a && b <= r.End {
-				kind = RangeMeta
-				name = r.Name
-				break
-			}
+		if r, ok := findMatchingRange(meta, a, b); ok {
+			out = append(out, ByteRange{Start: a, End: b, Kind: RangeMeta, Name: r.Name})
+			continue
 		}
-		if kind == RangeUnknown {
-			for _, r := range rules {
-				if r.Start <= a && b <= r.End {
-					kind = r.Kind
-					name = r.Name
-					break
-				}
-			}
+		if r, ok := findMatchingRange(rules, a, b); ok {
+			out = append(out, ByteRange{Start: a, End: b, Kind: r.Kind, Name: r.Name})
+			continue
 		}
 
-		out = append(out, ByteRange{
-			Start: a,
-			End:   b,
-			Kind:  kind,
-			Name:  name,
-		})
+		out = append(out, ByteRange{Start: a, End: b, Kind: RangeUnknown})
 	}
 
 	return coalesceRanges(out)
