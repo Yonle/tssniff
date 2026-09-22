@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Hub struct {
@@ -34,6 +35,7 @@ const (
 type Client struct {
 	remoteAddr string
 	q          chan *sharedPayload
+	slowCount  int // Consecutive full-buffer counter before hard drop
 }
 
 type sharedPayload struct {
@@ -72,7 +74,7 @@ func (p *sharedPayload) release() {
 
 func NewHub() *Hub {
 	h := &Hub{
-		cmd:  make(chan hubCommand, 128),
+		cmd:  make(chan hubCommand, 512), // Increased command queue size
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
@@ -133,17 +135,25 @@ func (h *Hub) run() {
 
 					select {
 					case client.q <- p:
+						// Reset slow counter on successful enqueue
+						client.slowCount = 0
+
 					default:
+						// Queue full: client is lagging behind
 						p.release()
+						client.slowCount++
 
-						delete(clients, client)
-						h.closeClient(client)
+						// Only drop after 10 consecutive full-buffer ticks
+						if client.slowCount >= 10 {
+							delete(clients, client)
+							h.closeClient(client)
 
-						log.Printf(
-							"TS HTTP client dropped: %s (slow, %d clients)",
-							client.remoteAddr,
-							len(clients),
-						)
+							log.Printf(
+								"TS HTTP client dropped: %s (slow, %d clients remaining)",
+								client.remoteAddr,
+								len(clients),
+							)
+						}
 					}
 				}
 
@@ -185,8 +195,11 @@ func (h *Hub) Serve(addr string) error {
 	mux.HandleFunc("/stream", h.handleStream)
 
 	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		WriteTimeout:      0, // Disabled for continuous video streaming
 	}
 
 	go func() {
@@ -230,9 +243,10 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 
+	// Increased queue capacity from 256 to 1024
 	client := &Client{
 		remoteAddr: r.RemoteAddr,
-		q:          make(chan *sharedPayload, 256),
+		q:          make(chan *sharedPayload, 1024),
 	}
 
 	addDone := make(chan struct{})
@@ -261,6 +275,12 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	flusher.Flush()
 
+	writeAndRelease := func(p *sharedPayload) error {
+		_, err := w.Write(p.data)
+		p.release()
+		return err
+	}
+
 	for {
 		select {
 		case <-r.Context().Done():
@@ -271,17 +291,29 @@ func (h *Hub) handleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			n, err := w.Write(payload.data)
-			payload.release()
-
-			if err != nil {
+			// Write primary payload
+			if err := writeAndRelease(payload); err != nil {
 				return
 			}
 
-			if n != len(payload.data) {
-				return
+			// Batch drain: write any additional pending payloads before flushing
+		drainLoop:
+			for {
+				select {
+				case p, ok := <-client.q:
+					if !ok {
+						flusher.Flush()
+						return
+					}
+					if err := writeAndRelease(p); err != nil {
+						return
+					}
+				default:
+					break drainLoop
+				}
 			}
 
+			// Flush once per batch
 			flusher.Flush()
 		}
 	}
@@ -295,17 +327,17 @@ func (h *Hub) closeClient(client *Client) {
 	}
 }
 
+// BroadcastBatch submits broadcast payloads asynchronously without blocking FUSE
 func (h *Hub) BroadcastBatch(parts [][]byte) {
 	if len(parts) == 0 {
 		return
 	}
 
-	done := make(chan struct{})
-
+	// Submit without waiting on a done channel to prevent FUSE stall
 	_ = h.submit(hubCommand{
 		op:    hubBroadcast,
 		parts: parts,
-		done:  done,
+		done:  nil,
 	})
 }
 
