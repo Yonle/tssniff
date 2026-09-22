@@ -10,40 +10,39 @@ set -euo pipefail
 #       Create/check the real sparse backing image.
 #
 #   prepare-tssniff
-#       modprobe nbd, start tssniff in the background (NBD server + nbd-client
-#       attachment + USB gadget configuration), and wait for /dev/nbdN to
-#       become ready.
+#       Start tssniff in the background.  tssniff mounts FUSE at
+#       $TSSNIFF_MOUNT, exposes disk.img there, and configures the USB
+#       Mass Storage gadget with disk.img as LUN 0.
 #
 #   stop-tssniff
-#       Stop the tssniff instance started by this script.  tssniff tears down
-#       its own USB gadget on shutdown.
+#       Stop the tssniff instance started by this script.  tssniff tears
+#       down its own USB gadget and unmounts FUSE on shutdown.
 #
 #   mount
 #       TEST ONLY:
-#       Mount partition 1 of the NBD device using the selected filesystem.
+#       Mount partition 1 of the FUSE-exposed disk.img locally.
 #
 #   unmount
 #       TEST ONLY:
 #       Unmount the test filesystem.
 #
 #   prepare-gadget
-#       Load the libcomposite kernel module and mount ConfigFS.  All gadget
-#       configuration (descriptors, functions, UDC bind) is performed by
-#       tssniff itself.
+#       Load the libcomposite kernel module and mount ConfigFS.  Actual
+#       gadget configuration is performed by tssniff itself.
 #
 #   find-udc
 #       Find/print available USB Device Controllers.
 #
 #   start
 #       prepare-fakedisk
-#       prepare-gadget (libcomposite only)
+#       prepare-gadget (libcomposite + configfs)
 #       prepare-tssniff (which configures the gadget)
 #
 #   stop
 #       Stop tssniff (which tears down its own gadget).
 #
 #   status
-#       Show state of disk, NBD device, tssniff and gadget.
+#       Show state of disk, FUSE mount, tssniff and gadget.
 #
 ###############################################################################
 
@@ -53,10 +52,13 @@ set -euo pipefail
 
 BACKING_IMAGE="${BACKING_IMAGE:-/srv/guoxin.img}"
 
-# Kernel NBD device that tssniff attaches to its NBD server.
-NBD_DEV="${NBD_DEV:-/dev/nbd0}"
+# FUSE mount point where tssniff exposes disk.img.
+TSSNIFF_MOUNT="${TSSNIFF_MOUNT:-/mnt/tsdisk}"
 
-# Where the test mount goes.
+# The FUSE-exposed file that the gadget uses as LUN 0.
+GADGET_IMAGE="${GADGET_IMAGE:-${TSSNIFF_MOUNT}/disk.img}"
+
+# Where the local test mount goes.
 TEST_MOUNT="${TEST_MOUNT:-/mnt/guoxin}"
 
 ###############################################################################
@@ -83,18 +85,13 @@ TSSNIFF="${TSSNIFF:-tssniff}"
 
 TSSNIFF_LISTEN="${TSSNIFF_LISTEN:-:6969}"
 TSSNIFF_VERBOSE="${TSSNIFF_VERBOSE:-}"
+TSSNIFF_DEBUG="${TSSNIFF_DEBUG:-}"
 
 TSSNIFF_PIDFILE="${TSSNIFF_PIDFILE:-/run/guoxin-tssniff.pid}"
 TSSNIFF_LOG="${TSSNIFF_LOG:-/var/log/guoxin-tssniff.log}"
 
 TSSNIFF_START_TIMEOUT="${TSSNIFF_START_TIMEOUT:-15}"
-
-###############################################################################
-# NBD kernel module
-###############################################################################
-
-NBD_MODULE_NBDS_MAX="${NBD_MODULE_NBDS_MAX:-4}"
-NBD_MODULE_MAX_PART="${NBD_MODULE_MAX_PART:-16}"
+TSSNIFF_STOP_TIMEOUT="${TSSNIFF_STOP_TIMEOUT:-15}"
 
 ###############################################################################
 # Fake disk
@@ -113,12 +110,12 @@ PARTITION_OFFSET="$(
 ###############################################################################
 # USB gadget
 #
-# NOTE:
-#   VID, PID, and descriptor strings are configured by tssniff itself
-#   (see usb_gadget.go).  They are not passed through this script.
+# The gadget name, descriptors, VID/PID, and UDC selection are configured
+# inside tssniff (see usb_gadget.go).  GADGET_NAME here must match the
+# constant in usb_gadget.go for `status` to find it.
 ###############################################################################
 
-GADGET_NAME="${GADGET_NAME:-guoxin}"
+GADGET_NAME="${GADGET_NAME:-tsdisk}"
 
 CONFIGFS="${CONFIGFS:-/sys/kernel/config}"
 GADGET="${CONFIGFS}/usb_gadget/${GADGET_NAME}"
@@ -142,15 +139,6 @@ warn() {
     echo "[!] $*" >&2
 }
 
-write_attr() {
-    local value="$1"
-    local path="$2"
-
-    info "write $path = ${value:-<empty>}"
-
-    printf '%s\n' "$value" > "$path"
-}
-
 ###############################################################################
 # Filesystem configuration
 ###############################################################################
@@ -158,14 +146,11 @@ write_attr() {
 configure_filesystem() {
     case "$FILESYSTEM" in
         fat32|vfat)
-            # "vfat" is Linux's driver/filesystem name.
-            # The on-disk filesystem and tssniff tracker are FAT32.
             TSSNIFF_FILESYSTEM="fat32"
             MOUNT_FILESYSTEM="vfat"
             BLKID_FILESYSTEM="vfat"
 
             if [[ -z "$PARTITION_TYPE" ]]; then
-                # FAT32 LBA.
                 PARTITION_TYPE=0c
             fi
             ;;
@@ -176,7 +161,6 @@ configure_filesystem() {
             BLKID_FILESYSTEM="exfat"
 
             if [[ -z "$PARTITION_TYPE" ]]; then
-                # Microsoft basic data / exFAT.
                 PARTITION_TYPE=7
             fi
             ;;
@@ -211,65 +195,19 @@ ensure_configfs() {
 }
 
 ###############################################################################
-# NBD helpers
+# FUSE helpers
 ###############################################################################
 
-nbd_device_ready() {
-    [[ -b "$NBD_DEV" ]] || return 1
-
-    local size
-    size="$(blockdev --getsize64 "$NBD_DEV" 2>/dev/null || echo 0)"
-
-    [[ "$size" -gt 0 ]]
+fuse_disk_ready() {
+    [[ -e "$GADGET_IMAGE" ]]
 }
 
-nbd_device_size() {
-    blockdev --getsize64 "$NBD_DEV" 2>/dev/null || echo 0
+fuse_disk_size() {
+    stat -c '%s' "$GADGET_IMAGE" 2>/dev/null || echo 0
 }
 
-# Returns the NBD partition device if the kernel exposed one
-# (requires max_part>=1 at modprobe time), otherwise falls back to the
-# whole-disk device with an explicit offset.
-detect_partition() {
-    if [[ -b "${NBD_DEV}p1" ]]; then
-        printf '%s\n' "${NBD_DEV}p1"
-    else
-        printf '%s\n' "$NBD_DEV"
-    fi
-}
-
-###############################################################################
-# NBD module load
-###############################################################################
-
-prepare_nbd_module() {
-    need_root
-
-    if [[ ! -b /dev/nbd0 ]]; then
-        info "loading nbd module (nbds_max=${NBD_MODULE_NBDS_MAX}, max_part=${NBD_MODULE_MAX_PART})"
-
-        if ! modprobe nbd \
-            nbds_max="${NBD_MODULE_NBDS_MAX}" \
-            max_part="${NBD_MODULE_MAX_PART}"
-        then
-            die \
-                "failed to load nbd; install linux-modules-extra or enable CONFIG_BLK_DEV_NBD"
-        fi
-
-        # Give udev a moment to create the node.
-        for _ in {1..20}; do
-            [[ -b /dev/nbd0 ]] && break
-            sleep 0.05
-        done
-
-        [[ -b /dev/nbd0 ]] ||
-            die "nbd module loaded but /dev/nbd0 did not appear"
-    fi
-
-    if ! command -v nbd-client >/dev/null 2>&1; then
-        die \
-            "nbd-client is not installed; install the nbd-client package"
-    fi
+fuse_mountpoint_active() {
+    mountpoint -q "$TSSNIFF_MOUNT"
 }
 
 ###############################################################################
@@ -532,8 +470,6 @@ prepare_tssniff() {
     command -v "$TSSNIFF" >/dev/null 2>&1 ||
         die "cannot find tssniff in PATH"
 
-    prepare_nbd_module
-
     ###########################################################################
     # Already running?
     ###########################################################################
@@ -545,12 +481,12 @@ prepare_tssniff() {
 
         info "tssniff already running (PID $pid)"
 
-        if nbd_device_ready; then
-            echo "  NBD device: $NBD_DEV ($(nbd_device_size) bytes)"
+        if fuse_disk_ready; then
+            echo "  FUSE disk: $GADGET_IMAGE ($(fuse_disk_size) bytes)"
             return
         fi
 
-        info "waiting for NBD device: $NBD_DEV"
+        info "waiting for FUSE disk: $GADGET_IMAGE"
 
         wait_for_tssniff
         return
@@ -563,38 +499,41 @@ prepare_tssniff() {
     rm -f "$TSSNIFF_PIDFILE"
 
     ###########################################################################
-    # If a previous run left /dev/nbdN attached, disconnect it first.
+    # Clean up any leftover FUSE mount.
     ###########################################################################
 
-    if nbd_device_ready; then
-        warn "detaching stale NBD device: $NBD_DEV"
-        nbd-client -d "$NBD_DEV" >/dev/null 2>&1 || true
-
-        for _ in {1..20}; do
-            nbd_device_ready || break
-            sleep 0.1
-        done
+    if fuse_mountpoint_active; then
+        warn "stale FUSE mount at $TSSNIFF_MOUNT; attempting to unmount"
+        fusermount3 -u "$TSSNIFF_MOUNT" 2>/dev/null \
+            || umount "$TSSNIFF_MOUNT" 2>/dev/null \
+            || die "could not unmount stale FUSE at $TSSNIFF_MOUNT"
     fi
+
+    mkdir -p "$TSSNIFF_MOUNT"
 
     ###########################################################################
     # Start.
     #
-    # tssniff owns the NBD server, the nbd-client attachment, and the USB
-    # gadget configuration (descriptors, functions, UDC bind).  This script
-    # only ensures libcomposite is loaded before tssniff starts.
+    # tssniff mounts FUSE at $TSSNIFF_MOUNT, exposes disk.img there, and
+    # configures the USB gadget with disk.img as LUN 0.  This script only
+    # ensures libcomposite is loaded before tssniff starts.
     ###########################################################################
 
     info "starting tssniff"
 
     local -a args=(
         -image "$BACKING_IMAGE"
+        -mount "$TSSNIFF_MOUNT"
         -listen "$TSSNIFF_LISTEN"
         -fs "$TSSNIFF_FILESYSTEM"
-        -nbd "$NBD_DEV"
     )
 
     if [[ -n "$TSSNIFF_VERBOSE" ]]; then
         args+=(-verbose)
+    fi
+
+    if [[ -n "$TSSNIFF_DEBUG" ]]; then
+        args+=(-debug)
     fi
 
     "$TSSNIFF" "${args[@]}" \
@@ -607,7 +546,8 @@ prepare_tssniff() {
 
     echo "  PID:        $pid"
     echo "  log:        $TSSNIFF_LOG"
-    echo "  NBD device: $NBD_DEV"
+    echo "  mount:      $TSSNIFF_MOUNT"
+    echo "  disk:       $GADGET_IMAGE"
     echo "  listen:     $TSSNIFF_LISTEN"
     echo "  filesystem: $TSSNIFF_FILESYSTEM"
 
@@ -617,17 +557,17 @@ prepare_tssniff() {
 wait_for_tssniff() {
     local i
 
-    info "waiting for NBD device to become ready"
+    info "waiting for FUSE disk"
 
     for ((i = 0; i < TSSNIFF_START_TIMEOUT; i++)); do
 
-        if nbd_device_ready; then
-            echo "  ready: $NBD_DEV ($(nbd_device_size) bytes)"
+        if fuse_disk_ready; then
+            echo "  ready: $GADGET_IMAGE ($(fuse_disk_size) bytes)"
             return 0
         fi
 
         if ! tssniff_is_running; then
-            warn "tssniff exited before attaching the NBD device"
+            warn "tssniff exited before creating the FUSE disk"
 
             echo
             echo "---- tssniff log ----"
@@ -649,24 +589,15 @@ wait_for_tssniff() {
     done
 
     die \
-        "timed out waiting for $NBD_DEV to become ready"
+        "timed out waiting for $GADGET_IMAGE"
 }
 
 stop_tssniff() {
     need_root
 
     ###########################################################################
-    # Detach NBD device first, otherwise tssniff may block on shutdown while
-    # NBD_DO_IT is still running.
-    ###########################################################################
-
-    if nbd_device_ready; then
-        info "detaching NBD device: $NBD_DEV"
-        nbd-client -d "$NBD_DEV" >/dev/null 2>&1 || true
-    fi
-
-    ###########################################################################
-    # Kill tssniff.  tssniff removes its own USB gadget on shutdown.
+    # Kill tssniff.  It tears down its own USB gadget and unmounts FUSE on
+    # SIGTERM (see main.go's signal handler and deferred Teardown / Unmount).
     ###########################################################################
 
     if [[ ! -f "$TSSNIFF_PIDFILE" ]]; then
@@ -688,7 +619,7 @@ stop_tssniff() {
 
         kill "$pid"
 
-        for _ in {1..10}; do
+        for ((i = 0; i < TSSNIFF_STOP_TIMEOUT * 5; i++)); do
             if ! kill -0 "$pid" 2>/dev/null; then
                 break
             fi
@@ -704,6 +635,17 @@ stop_tssniff() {
 
     rm -f "$TSSNIFF_PIDFILE"
 
+    ###########################################################################
+    # If FUSE is still mounted (SIGKILL path), force-unmount it.
+    ###########################################################################
+
+    if fuse_mountpoint_active; then
+        warn "forcing FUSE unmount at $TSSNIFF_MOUNT"
+        fusermount3 -u "$TSSNIFF_MOUNT" 2>/dev/null \
+            || umount -l "$TSSNIFF_MOUNT" 2>/dev/null \
+            || true
+    fi
+
     echo "tssniff stopped"
 }
 
@@ -714,9 +656,9 @@ stop_tssniff() {
 test_mount() {
     need_root
 
-    nbd_device_ready ||
+    fuse_disk_ready ||
         die \
-            "NBD device is not ready: $NBD_DEV
+            "FUSE disk is not ready: $GADGET_IMAGE
 Run: $0 prepare-tssniff"
 
     mkdir -p "$TEST_MOUNT"
@@ -727,31 +669,16 @@ Run: $0 prepare-tssniff"
         return
     fi
 
-    local source
-    source="$(detect_partition)"
-
-    info "mounting NBD device"
+    info "mounting FUSE disk"
     info "filesystem: $MOUNT_FILESYSTEM"
-    info "source:     $source"
+    info "source:     $GADGET_IMAGE"
     info "target:     $TEST_MOUNT"
 
-    if [[ "$source" == "$NBD_DEV" ]]; then
-        #######################################################################
-        # Kernel did not expose a partition node, use explicit offset.
-        #######################################################################
-
-        mount \
-            -t "$MOUNT_FILESYSTEM" \
-            -o "offset=${PARTITION_OFFSET},sync" \
-            "$source" \
-            "$TEST_MOUNT"
-    else
-        mount \
-            -t "$MOUNT_FILESYSTEM" \
-            -o "sync" \
-            "$source" \
-            "$TEST_MOUNT"
-    fi
+    mount \
+        -t "$MOUNT_FILESYSTEM" \
+        -o "loop,offset=${PARTITION_OFFSET},sync" \
+        "$GADGET_IMAGE" \
+        "$TEST_MOUNT"
 
     echo
     echo "test filesystem mounted:"
@@ -814,22 +741,17 @@ find_udc() {
 start_gadget() {
     need_root
 
-    info "STEP 1/4: prepare fake disk"
+    info "STEP 1/3: prepare fake disk"
     prepare_fakedisk
 
     echo
 
-    info "STEP 2/4: check nbd module"
-    prepare_nbd_module
-
-    echo
-
-    info "STEP 3/4: prepare libcomposite"
+    info "STEP 2/3: prepare libcomposite"
     prepare_gadget
 
     echo
 
-    info "STEP 4/4: start tssniff (configures gadget itself)"
+    info "STEP 3/3: start tssniff (configures gadget itself)"
     prepare_tssniff
 }
 
@@ -896,6 +818,7 @@ status_gadget() {
     if tssniff_is_running; then
         echo "  state:   running"
         echo "  pid:     $(cat "$TSSNIFF_PIDFILE")"
+        echo "  mount:   $TSSNIFF_MOUNT"
         echo "  listen:  $TSSNIFF_LISTEN"
         echo "  fs:      $TSSNIFF_FILESYSTEM"
         echo "  log:     $TSSNIFF_LOG"
@@ -906,27 +829,26 @@ status_gadget() {
     echo
 
     ###########################################################################
-    # NBD device
+    # FUSE mount
     ###########################################################################
 
-    echo "=== NBD device ==="
+    echo "=== FUSE mount ==="
 
-    echo "  device:  $NBD_DEV"
+    echo "  mount:   $TSSNIFF_MOUNT"
 
-    if [[ -b "$NBD_DEV" ]]; then
-        local sz
-        sz="$(nbd_device_size)"
-
-        echo "  state:   present"
-        echo "  size:    $sz bytes"
-
-        if [[ -b "${NBD_DEV}p1" ]]; then
-            echo "  part:    ${NBD_DEV}p1"
-        else
-            echo "  part:    (none; kernel partition scan disabled)"
-        fi
+    if fuse_mountpoint_active; then
+        echo "  state:   mounted"
+        findmnt -T "$TSSNIFF_MOUNT" || true
     else
-        echo "  state:   MISSING"
+        echo "  state:   not mounted"
+    fi
+
+    echo "  disk:    $GADGET_IMAGE"
+
+    if fuse_disk_ready; then
+        echo "  size:    $(fuse_disk_size) bytes"
+    else
+        echo "  MISSING"
     fi
 
     echo
@@ -970,7 +892,9 @@ status_gadget() {
     echo "=== Gadget (owned by tssniff) ==="
 
     if [[ ! -d "$GADGET" ]]; then
-        echo "  inactive"
+        echo "  inactive (expected at $GADGET)"
+        echo
+        echo "  note: GADGET_NAME must match the constant in usb_gadget.go."
         return 0
     fi
 
@@ -1021,23 +945,24 @@ Environment:
       fat32 (default), vfat, or exfat
 
   BACKING_IMAGE=/srv/guoxin.img
-  NBD_DEV=/dev/nbd0
+  TSSNIFF_MOUNT=/mnt/tsdisk
+  GADGET_IMAGE=/mnt/tsdisk/disk.img
   TEST_MOUNT=/mnt/guoxin
 
   TSSNIFF=tssniff
   TSSNIFF_LISTEN=:6969
   TSSNIFF_VERBOSE=
+  TSSNIFF_DEBUG=
   TSSNIFF_PIDFILE=/run/guoxin-tssniff.pid
   TSSNIFF_LOG=/var/log/guoxin-tssniff.log
   TSSNIFF_START_TIMEOUT=15
-
-  NBD_MODULE_NBDS_MAX=4
-  NBD_MODULE_MAX_PART=16
+  TSSNIFF_STOP_TIMEOUT=15
 
   DISK_SIZE=1T
   PARTITION_START_LBA=2048
 
-  GADGET_NAME=guoxin
+  GADGET_NAME=tsdisk
+      must match the constant in usb_gadget.go
   UDC=<udc-name>
 
 Examples:

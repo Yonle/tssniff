@@ -1,11 +1,12 @@
 package main
 
-type RangeKind int
+type RangeKind uint8
 
 const (
-	RangeUnknown RangeKind = iota
-	RangeMeta
-	RangeData
+	RangeMeta RangeKind = iota
+	RangeNormal
+	RangeTS
+	RangeUnknown
 )
 
 type ByteRange struct {

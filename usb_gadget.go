@@ -83,22 +83,21 @@ func (g *USBGadget) Setup() error {
 
 // Teardown removes the gadget.
 func (g *USBGadget) Teardown() {
-	// Unbind UDC.
-	g.writeFile(filepath.Join(gadgetPath, "UDC"), "")
+	// Nothing to tear down if the gadget was never created.
+	if _, err := os.Stat(gadgetPath); os.IsNotExist(err) {
+		return
+	}
 
-	// Remove symlink.
+	// Unbind UDC (only if the file exists).
+	udcFile := filepath.Join(gadgetPath, "UDC")
+	if _, err := os.Stat(udcFile); err == nil {
+		g.writeFile(udcFile, "")
+	}
+
 	os.Remove(filepath.Join(gadgetPath, "configs/c.1/mass_storage.0"))
-
-	// Remove function.
 	os.RemoveAll(filepath.Join(gadgetPath, "functions/mass_storage.0"))
-
-	// Remove config.
 	os.RemoveAll(filepath.Join(gadgetPath, "configs/c.1"))
-
-	// Remove strings.
 	os.RemoveAll(filepath.Join(gadgetPath, "strings/0x409"))
-
-	// Remove gadget.
 	os.RemoveAll(gadgetPath)
 }
 
@@ -115,6 +114,9 @@ func (g *USBGadget) findUDC() (string, error) {
 
 func (g *USBGadget) writeFile(path, value string) {
 	if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+		if os.IsNotExist(err) { // nonfatal
+			return
+		}
 		log.Printf("Warning: write %s: %v", path, err)
 	}
 }

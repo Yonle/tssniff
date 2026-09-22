@@ -4,39 +4,36 @@ const (
 	tsPacketSize = 188
 	tsSyncByte   = 0x47
 
-	// maxBroadcastPackets bounds how many TS packets end up in a single
-	// hub.Broadcast. Smaller chunks keep per-client channel entries small so
-	// a slow client cannot balloon RSS. 128 * 188 ≈ 24 KB per broadcast.
+	// Minimum number of consecutive, 188-byte-aligned 0x47 bytes required
+	// before we accept a region as transport stream data.  A 512-byte
+	// metadata update can hold at most 2 packets, so anything >= 10
+	// rejects false positives.
+	minTSPackets = 10
+
+	// maxBroadcastPackets bounds the size of a single hub.Broadcast.
 	maxBroadcastPackets = 128
 )
 
-// findMPEGTSOffset validates TS alignment using 188-byte stride verification
 func findMPEGTSOffset(data []byte) (int, bool) {
-	if len(data) < tsPacketSize {
+	if len(data) < tsPacketSize*minTSPackets {
 		return 0, false
 	}
-
-	for i := 0; i <= len(data)-tsPacketSize; i++ {
+	limit := len(data) - tsPacketSize*minTSPackets
+	for i := 0; i <= limit; i++ {
 		if data[i] != tsSyncByte {
 			continue
 		}
-
-		// Verify 188-byte stride across available buffer to prevent false positives on payload bytes
-		validStride := true
-		checked := 0
-		for j := i; j+tsPacketSize <= len(data) && checked < 3; j += tsPacketSize {
+		ok := true
+		for j := i; j < i+tsPacketSize*minTSPackets; j += tsPacketSize {
 			if data[j] != tsSyncByte {
-				validStride = false
+				ok = false
 				break
 			}
-			checked++
 		}
-
-		if validStride {
+		if ok {
 			return i, true
 		}
 	}
-
 	return 0, false
 }
 

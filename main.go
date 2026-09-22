@@ -5,34 +5,37 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 )
 
 var verbLog bool
 
 func main() {
-	image := flag.String("image", "/srv/guoxin.img", "sparse backing image for metadata")
-	listenAddr := flag.String("listen", ":6969", "TCP TS stream listener")
+	mountPoint := flag.String("mount", "/mnt/tsdisk", "FUSE mount point")
+	image := flag.String("image", "/srv/guoxin.img", "sparse backing image")
+	listenAddr := flag.String("listen", ":6969", "HTTP stream listener")
 	filesystem := flag.String("fs", "fat32", "filesystem type")
-	preserve := flag.Bool("preserve", false, "preserve MPEG-TS data to /dev/shm")
-	nbdDev := flag.String("nbd", "/dev/nbd0", "NBD device path")
-	noGadget := flag.Bool("no-gadget", false, "skip USB gadget setup (for local testing against /dev/nbd0)")
+	debug := flag.Bool("debug", false, "FUSE debug")
+	preserve := flag.Bool("preserve", false, "preserve TS to /dev/shm")
+	noGadget := flag.Bool("no-gadget", false, "skip USB gadget setup")
 	flag.BoolVar(&verbLog, "verbose", false, "verbose logging")
 	flag.Parse()
 
-	// 1. Open the sparse backing image (metadata only).
 	imgFile, err := os.OpenFile(*image, os.O_RDWR, 0666)
 	if err != nil {
 		log.Fatalf("open sparse image %s: %v", *image, err)
 	}
 	defer imgFile.Close()
 
-	imgInfo, err := imgFile.Stat()
+	st, err := imgFile.Stat()
 	if err != nil {
 		log.Fatalf("stat sparse image: %v", err)
 	}
+	if !st.Mode().IsRegular() {
+		log.Fatalf("%s is not a regular file", *image)
+	}
 
-	// 2. Parse MBR to find partition boundaries.
 	part, err := findMBRPartition(imgFile, *filesystem)
 	if err != nil {
 		log.Printf("Warning: MBR partition check: %v (raw device mode)", err)
@@ -41,11 +44,13 @@ func main() {
 			*filesystem, part.Offset, part.Size)
 	}
 
-	// 3. Initialize Hub and Tracker.
 	hub := NewHub()
 	tracker := NewFSTracker(*filesystem, part, imgFile)
 
-	// 4. /dev/shm buffer (only when preserve is enabled).
+	if verbLog {
+		log.Printf("tracker: metaEnd=%d", tracker.MetadataEnd())
+	}
+
 	var shm *ShmBuffer
 	if *preserve {
 		shm, err = NewShmBuffer()
@@ -56,36 +61,48 @@ func main() {
 		log.Printf("Preserve enabled, using %s", shm.Path())
 	}
 
-	// 5. Start HTTP TS stream server.
 	go startStreamServer(*listenAddr, hub)
 
-	// 6. Create NBD backend and server.
-	backend := NewNBDBackend(imgFile, imgInfo.Size(), hub, tracker, *preserve, shm)
-	nbdSrv := NewNBDServer(backend, *nbdDev)
-	if err := nbdSrv.Start(); err != nil {
-		log.Fatalf("start NBD server: %v", err)
+	if err := os.MkdirAll(*mountPoint, 0755); err != nil {
+		log.Fatalf("mkdir %s: %v", *mountPoint, err)
 	}
-	defer nbdSrv.Stop()
 
-	// 7. Set up USB gadget with the NBD device as backing (optional).
+	server, err := mountDiskFS(DiskFSOpts{
+		MountPoint: *mountPoint,
+		Image:      imgFile,
+		Hub:        hub,
+		Tracker:    tracker,
+		Preserve:   *preserve,
+		Shm:        shm,
+		Debug:      *debug,
+	})
+	if err != nil {
+		log.Fatalf("mount FUSE: %v", err)
+	}
+
+	diskPath := filepath.Join(*mountPoint, "disk.img")
+	log.Printf("FUSE disk: %s", diskPath)
+	log.Printf("Stream:    http://localhost%s/stream", *listenAddr)
+
+	var gadget *USBGadget
 	if !*noGadget {
-		gadget := NewUSBGadget(*nbdDev)
+		gadget = NewUSBGadget(diskPath)
 		if err := gadget.Setup(); err != nil {
 			log.Fatalf("USB gadget setup: %v", err)
 		}
 		defer gadget.Teardown()
-		log.Printf("USB gadget active. STB can now access the virtual disk.")
+		log.Printf("USB gadget active, backing: %s", diskPath)
 	} else {
-		log.Printf("USB gadget skipped (-no-gadget). %s is ready for local testing.", *nbdDev)
+		log.Printf("USB gadget skipped (-no-gadget)")
 	}
 
-	log.Printf("TSSniff running. Stream: http://localhost%s/stream", *listenAddr)
-
-	// 8. Wait for signal.
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 
 	log.Println("Shutting down...")
-	backend.Flush()
+	if gadget != nil {
+		gadget.Teardown()
+	}
+	server.Unmount()
 }
