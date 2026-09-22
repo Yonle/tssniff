@@ -26,7 +26,9 @@ storage        interception
                  TCP :6969
 ```
 
-The fake disk is a complete disk image containing an MBR partition table and an exFAT partition.
+The fake disk is a complete disk image containing an MBR partition table and a FAT32 partition by default.
+
+The filesystem can optionally be changed to exFAT.
 
 ## Usage
 
@@ -48,6 +50,8 @@ Options:
 
 ## Disk layout
 
+By default:
+
 ```text
 +---------------------------+
 | MBR                       |
@@ -55,11 +59,13 @@ Options:
 | alignment                 |
 +---------------------------+
 | Partition 1               |
-| exFAT                     |
+| FAT32                     |
 +---------------------------+
 ```
 
-`tssniff` reads the MBR to locate the exFAT partition.
+exFAT can be selected when preparing the fake disk.
+
+`tssniff` reads the MBR to locate the filesystem partition.
 
 Partition detection is separated from filesystem handling so additional partition-table formats can be implemented later.
 
@@ -83,9 +89,17 @@ The complete disk image, including the MBR and partition table, is exposed throu
 
 This allows filesystem writes to be inspected before they reach the backing image.
 
+## Filesystem handling
+
+`tssniff` currently supports FAT32 as the default filesystem and can also operate with exFAT.
+
+The filesystem layer tracks directory entries, file metadata, and file data ranges so that writes can be associated with their corresponding filenames.
+
+Filesystem handling is separated from partition detection, allowing additional filesystem implementations to be added later.
+
 ## TS interception
 
-`tssniff` tracks the exFAT filesystem and associates file data ranges with filenames.
+`tssniff` tracks the filesystem and associates file data ranges with filenames.
 
 Writes to `.ts` files are intercepted and forwarded to connected TCP clients.
 
@@ -164,3 +178,5 @@ USB Mass Storage
 ## Status
 
 `tssniff` is experimental software for faking USB storage media and intercepting MPEG-TS file writes on Linux.
+
+FAT32 is currently the default filesystem for generated fake disks, with exFAT available as an alternative.
