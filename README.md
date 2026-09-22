@@ -98,7 +98,7 @@ Options:
 | `-preserve` | `false` | Also write recording data to `/dev/shm` |
 | `-no-gadget` | `false` | Skip USB gadget setup (for local testing) |
 | `-debug` | `false` | FUSE debug logging |
-| `-verbose` | `false` | Verbose logging (write classification, tracker state) |
+| `-verbose` | `false` | Verbose logging (write classification, TS filtering, tracker state) |
 
 The captured stream is available at:
 
@@ -112,6 +112,8 @@ Clients:
 mpv http://localhost:6969/stream
 ffmpeg -i http://127.0.0.1:6969/stream -c copy out.ts
 ```
+
+Response headers are flushed as soon as a client connects, before any data is available. A client that opens the stream while nothing is recording sees a live connection waiting for data, not a hang.
 
 A client that cannot keep up is not disconnected. The hub drops the oldest queued chunk for that client to make room for the newest one. This keeps the live stream flowing and avoids the reconnect stutter that a disconnect-on-slow policy causes. There is no authentication; run the HTTP server on a trusted network.
 
@@ -146,14 +148,20 @@ For a `.ts` recording, the first two reflect what the host sees. The third is un
 
 ## TS extraction
 
-Not everything above the metadata window is transport stream. The host writes small in-file bookkeeping (headers, index updates) at fixed offsets inside the recording. Those writes are above the metadata window and would be broadcast verbatim if the classification were purely offset-based.
+Not everything above the metadata window is transport stream. A DVB recorder writes small bookkeeping blocks (file headers, index updates) at fixed offsets inside the recording file. Those writes are above the metadata window and would be broadcast verbatim if classification were purely offset-based.
 
-`DiskNode.broadcastTS` filters them out with two rules:
+`DiskNode.broadcastTS` keeps only valid transport stream bytes, using three rules:
 
-1. **Offset continuity.** A TS write is accepted only if its offset equals the byte after the previous accepted TS write. Bookkeeping writes to unrelated offsets are dropped.
-2. **Stride resync.** The accepted bytes are appended to a small buffer, and only complete runs of 188-byte packets beginning with `0x47` are broadcast. A partial packet at the end of a buffer is retained until the next write completes it.
+1. **Directional continuity.** A TS write is accepted only if its offset is at or above the frontier of the current stream (the byte after the last accepted TS write).
+   - Writes **below** the frontier are bookkeeping at the file's start. They are dropped silently.
+   - Writes **at** the frontier are normal continuation.
+   - Writes **above** the frontier are the first write of a new recording. The pending buffer is flushed, and the frontier jumps to the new offset.
 
-Together these mean the HTTP stream contains only valid, contiguous transport stream packets. Bookkeeping writes never reach clients.
+2. **Directory reset.** A write to the root directory cluster (where the recorder creates or finalises a `.ts` entry) resets the frontier. This ensures the next recording starts with a clean state even if the recorder picks a starting offset below the previous frontier.
+
+3. **Stride resync.** Accepted bytes are appended to a small buffer, and only complete runs of 188-byte packets beginning with `0x47` are broadcast. A partial packet at the end of the buffer is retained until the next write completes it.
+
+Together these mean the HTTP stream contains only valid, contiguous transport stream packets. Bookkeeping writes, FAT table updates, and directory entry churn never reach clients.
 
 ## `gadget.sh`
 
@@ -229,7 +237,7 @@ The kernel presents this to the host as a normal removable USB drive. The host p
 GET /stream
 ```
 
-The response is a chunked `video/mp2t` stream. Its body is the sequence of transport stream bytes the host has written, filtered for stride alignment and offset continuity as described above.
+The response is a chunked `video/mp2t` stream. Headers are flushed immediately on connect. The body is the sequence of transport stream bytes the host has written, filtered by the rules described in *TS extraction* above.
 
 The HTTP server is independent of the USB gadget. The gadget provides the storage interface to the host; the HTTP server provides the same data to network clients.
 
@@ -241,4 +249,4 @@ FAT32 is the default filesystem and is the only one currently supported end-to-e
 
 The host's filesystem driver may report the volume as "not properly unmounted" after a recording session, because `tssniff` does not intercept shutdown-time writes from a host that has already stopped writing. This is cosmetic; the filesystem remains consistent.
 
-The current design assumes one recording file is being written at a time and that its data clusters are contiguous from the host's point of view. A host that writes two recordings concurrently, or that fragments a single recording across distant clusters, will produce gaps in the broadcast stream. The offset-continuity rule in `broadcastTS` is the only safeguard; it drops anything that does not continue the current stream rather than risk corrupting it.
+The TS extraction rules assume a single recording file is being written at a time, that its data clusters are written in monotonically increasing order, and that the host only writes backwards when updating the file's bookkeeping region. A host that interleaves two concurrent recordings, or that seeks backwards to rewrite recorded data, will not be captured correctly. The directional continuity check drops anything that does not continue the current stream rather than risk corrupting it; the directory reset ensures a fresh recording always starts cleanly regardless of where its first cluster sits on the disk.
