@@ -81,7 +81,7 @@ go build -o tssniff .
 
 ```sh
 sudo ./tssniff \
-    -image /srv/guoxin.img \
+    -image /dev/shm/guoxin.img \
     -mount /mnt/tsdisk \
     -listen :6969 \
     -fs fat32
@@ -91,7 +91,7 @@ Options:
 
 | Option | Default | Description |
 |---|---|---|
-| `-image` | `/srv/guoxin.img` | Sparse backing image for filesystem metadata |
+| `-image` | `/dev/shm/guoxin.img` | Sparse backing image for filesystem metadata |
 | `-mount` | `/mnt/tsdisk` | FUSE mount point |
 | `-listen` | `:6969` | HTTP listen address |
 | `-fs` | `fat32` | Filesystem type (`fat32` or `exfat`) |
