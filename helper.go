@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strings"
 	"syscall"
 )
 
@@ -38,14 +37,6 @@ func containsByte(values []byte, needle byte) bool {
 		}
 	}
 	return false
-}
-
-func isTSFile(name string) bool {
-	name = strings.ToLower(name)
-	return strings.HasSuffix(name, ".ts") ||
-		strings.HasSuffix(name, ".tsv") ||
-		strings.HasSuffix(name, ".m2ts") ||
-		strings.HasSuffix(name, ".trp")
 }
 
 func toErrno(err error) syscall.Errno {
