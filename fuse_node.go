@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -139,7 +140,12 @@ func (d *DiskNode) Write(
 		if seg.Kind == RangeTS {
 			d.broadcastTS(part, seg.Start)
 		} else {
+			start := time.Now()
 			n, err := d.imgFile.WriteAt(part, int64(seg.Start))
+			dely := time.Since(start)
+			if dely > 20*time.Millisecond {
+				log.Printf("slow META write off=%d len=%d took=%v", seg.Start, len(part), dely)
+			}
 			if err != nil {
 				return uint32(rel), toErrno(err)
 			}
@@ -168,7 +174,7 @@ func (d *DiskNode) Flush(
 	ctx context.Context,
 	fh fs.FileHandle,
 ) syscall.Errno {
-	return toErrno(d.imgFile.Sync())
+	return d._sync(ctx)
 }
 
 func (d *DiskNode) Fsync(
@@ -176,7 +182,19 @@ func (d *DiskNode) Fsync(
 	fh fs.FileHandle,
 	flags uint32,
 ) syscall.Errno {
-	return toErrno(d.imgFile.Sync())
+	return d._sync(ctx)
+}
+
+func (d *DiskNode) _sync(
+	ctx context.Context,
+) syscall.Errno {
+	start := time.Now()
+	err := toErrno(d.imgFile.Sync())
+	dely := time.Since(start)
+	if dely > 20*time.Millisecond {
+		log.Printf("slow sync took=%v", dely)
+	}
+	return err
 }
 
 func (d *DiskNode) broadcastTS(data []byte, off uint64) {
