@@ -51,16 +51,6 @@ func main() {
 		log.Printf("tracker: metaEnd=%d", tracker.MetadataEnd())
 	}
 
-	var shm *ShmBuffer
-	if *preserve {
-		shm, err = NewShmBuffer()
-		if err != nil {
-			log.Fatalf("create /dev/shm buffer: %v", err)
-		}
-		defer shm.Close()
-		log.Printf("Preserve enabled, using %s", shm.Path())
-	}
-
 	go startStreamServer(*listenAddr, hub)
 
 	if err := os.MkdirAll(*mountPoint, 0755); err != nil {
@@ -73,7 +63,6 @@ func main() {
 		Hub:        hub,
 		Tracker:    tracker,
 		Preserve:   *preserve,
-		Shm:        shm,
 		Debug:      *debug,
 	})
 	if err != nil {

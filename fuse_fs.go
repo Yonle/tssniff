@@ -30,7 +30,6 @@ type DiskFSOpts struct {
 	Hub        *Hub
 	Tracker    *FSTracker
 	Preserve   bool
-	Shm        *ShmBuffer
 	Debug      bool
 }
 
@@ -58,7 +57,6 @@ func mountDiskFS(o DiskFSOpts) (*fuse.Server, error) {
 				hub:      o.Hub,
 				tracker:  o.Tracker,
 				preserve: o.Preserve,
-				shm:      o.Shm,
 			}
 
 			child := root.NewPersistentInode(

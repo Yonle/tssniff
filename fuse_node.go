@@ -20,7 +20,6 @@ type DiskNode struct {
 	hub      *Hub
 	tracker  *FSTracker
 	preserve bool
-	shm      *ShmBuffer
 
 	tsBuf      []byte
 	tsNextOff  uint64
