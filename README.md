@@ -82,7 +82,7 @@ go build -o tssniff .
 
 ```sh
 sudo ./tssniff \
-    -image /dev/shm/guoxin.img \
+    -image /srv/guoxin.img \
     -mount /mnt/tsdisk \
     -listen :6969
 ```
@@ -212,7 +212,7 @@ sudo ./gadget.sh status
 sudo ./gadget.sh stop
 ```
 
-The backing image path is controlled by `BACKING_IMAGE`. Pointing it at `/dev/shm/guoxin.img` removes disk I/O from the metadata path entirely, which eliminates the last source of latency in the write pipeline.
+The backing image path is controlled by `BACKING_IMAGE`. Pointing it at `/srv/guoxin.img` removes disk I/O from the metadata path entirely, which eliminates the last source of latency in the write pipeline.
 
 ## Testing without a USB gadget
 
