@@ -32,7 +32,7 @@ func startStreamServer(addr string, hub *Hub) {
 		client := hub.Register(r.Context())
 		defer hub.Unregister(client)
 
-		for data := range client.ch {
+		for data := range client.Ch() {
 			if _, err := w.Write(data); err != nil {
 				return
 			}
