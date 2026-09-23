@@ -138,6 +138,15 @@ func (d *DiskNode) Write(
 		}
 
 		if seg.Kind == RangeTS {
+			if d.preserve {
+				n, err := d.imgFile.WriteAt(part, int64(seg.Start))
+				if err != nil {
+					return uint32(rel), toErrno(err)
+				}
+				if n != len(part) {
+					return uint32(rel + uint64(n)), syscall.EIO
+				}
+			}
 			d.broadcastTS(part, seg.Start)
 		} else {
 			start := time.Now()
@@ -260,11 +269,6 @@ func (d *DiskNode) broadcastTS(data []byte, off uint64) {
 		copy(payload, d.tsBuf[:n])
 
 		d.hub.Broadcast(payload)
-		if d.preserve && d.shm != nil {
-			if _, err := d.shm.Write(payload); err != nil && verbLog {
-				log.Printf("shm write: %v", err)
-			}
-		}
 
 		rem := len(d.tsBuf) - n
 		copy(d.tsBuf, d.tsBuf[n:])
