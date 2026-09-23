@@ -2,7 +2,7 @@
 
 `tssniff` is a Linux userspace utility that presents a **fake USB storage medium** to a connected host, captures the MPEG-TS data the host writes to it, and makes that data available as an HTTP stream.
 
-The host sees an ordinary MBR-partitioned FAT32 (or exFAT) disk and writes to it normally. Filesystem metadata is persisted to a sparse backing image. File data of MPEG-TS recordings is broadcast to HTTP clients instead of being written to disk.
+The host sees an ordinary MBR-partitioned FAT32 disk and writes to it normally. Filesystem metadata is persisted to a sparse backing image. File data of MPEG-TS recordings is broadcast to HTTP clients instead of being written to disk.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ sparse image       HTTP /stream
 The gadget's LUN points at a file exposed by `tssniff` through FUSE. Every `write()` the host issues against that file lands in `DiskNode.Write`, where the offset is classified:
 
 - Writes inside the filesystem metadata window (MBR, boot sector, both FAT tables, root directory) are persisted to the sparse backing image.
-- Writes outside that window are treated as recording data. They are broadcast over HTTP and are **not** written to the sparse image. With `-preserve`, they are additionally written to `/dev/shm` (tmpfs), never to the sparse image.
+- Writes outside that window are treated as recording data. They are broadcast over HTTP and are **not** written to the sparse image by default. With `-preserve`, they are additionally written to the sparse image at their real offsets, so the recording can be read back later.
 
 The metadata window is derived from the FAT boot sector at startup, so it scales with the size of the filesystem. A 1 TB FAT32 volume with 64 KB clusters has a metadata window of roughly 134 MiB.
 
@@ -37,6 +37,8 @@ The metadata window is derived from the FAT boot sector at startup, so it scales
 The two flags that matter are `DirectMount` and `FOPEN_DIRECT_IO`. Together they keep the host's writes on the FUSE callback path, so `DiskNode.Write` sees each SCSI WRITE within microseconds. Without them, the kernel page cache holds dirty pages for up to `dirty_expire_centisecs` (30 s by default), which makes the HTTP stream lag by tens of seconds and breaks the illusion of a live recorder. Both flags are set unconditionally by `mountDiskFS`.
 
 This is also why the USB gadget must back onto the FUSE file directly. Putting a loop device on top of a FUSE file reintroduces the block layer between the host and `tssniff`, and with it the same 30-second writeback delay. The gadget's LUN points at `/mnt/tsdisk/disk.img`, not at a loop device.
+
+`DisableSplice` is also set. On some kernels — notably certain SBC BSP forks — the kernel's `splice()` path from a FUSE connection into the backing file faults pages in a way tmpfs or the backing filesystem cannot satisfy, delivering `SIGBUS` to the daemon. Disabling splice uses ordinary read/write on the FUSE fd instead, at the cost of one extra memory copy per I/O. Metadata writes are small enough that the cost is negligible.
 
 ## Requirements
 
@@ -59,13 +61,12 @@ On most SBC images these are already present. On generic distributions they are 
 | `fuse3` | `fusermount3`, `libfuse3` | `tssniff` mount |
 | `util-linux` | `sfdisk`, `losetup`, `blkid` | `gadget.sh prepare-fakedisk` |
 | `dosfstools` | `mkfs.fat` | FAT32 formatting |
-| `exfatprogs` | `mkfs.exfat` | exFAT formatting (only if `FILESYSTEM=exfat`) |
 | Go ≥ 1.20 | Building `tssniff` | `go build` |
 
 Install on Debian/Ubuntu/Raspberry Pi OS:
 
 ```sh
-sudo apt install fuse3 dosfstools exfatprogs
+sudo apt install fuse3 dosfstools
 ```
 
 ## Build
@@ -83,19 +84,17 @@ go build -o tssniff .
 sudo ./tssniff \
     -image /dev/shm/guoxin.img \
     -mount /mnt/tsdisk \
-    -listen :6969 \
-    -fs fat32
+    -listen :6969
 ```
 
 Options:
 
 | Option | Default | Description |
 |---|---|---|
-| `-image` | `/dev/shm/guoxin.img` | Sparse backing image for filesystem metadata |
+| `-image` | `/srv/guoxin.img` | Sparse backing image for filesystem metadata |
 | `-mount` | `/mnt/tsdisk` | FUSE mount point |
 | `-listen` | `:6969` | HTTP listen address |
-| `-fs` | `fat32` | Filesystem type (`fat32` or `exfat`) |
-| `-preserve` | `false` | Also write recording data to `/dev/shm` |
+| `-preserve` | `false` | Also write recording data to the sparse image |
 | `-no-gadget` | `false` | Skip USB gadget setup (for local testing) |
 | `-debug` | `false` | FUSE debug logging |
 | `-verbose` | `false` | Verbose logging (write classification, TS filtering, tracker state) |
@@ -119,7 +118,7 @@ A client that cannot keep up is not disconnected. The hub drops the oldest queue
 
 ## Disk layout
 
-The fake disk is a standard MBR image with one FAT32 (or exFAT) partition:
+The fake disk is a standard MBR image with one FAT32 partition:
 
 ```text
 +---------------------------+
@@ -128,11 +127,34 @@ The fake disk is a standard MBR image with one FAT32 (or exFAT) partition:
 | alignment                 |  LBA 2048
 +---------------------------+
 | Partition 1               |
-| FAT32 (or exFAT)          |
+| FAT32                     |
 +---------------------------+
 ```
 
 The backing image is sparse. Its logical size is the full disk size, but its allocated size on disk is only what the metadata window costs. For a 1 TB FAT32 volume, this is roughly 130–150 MiB after a full recording session, regardless of how many gigabytes of MPEG-TS were written.
+
+Because the image is sparse and only the metadata window is ever written, the actual RAM or disk cost of the image at any moment is a small fraction of its logical size. `du` on the image reports allocated pages; `ls -l` reports the logical size. They are unrelated for a sparse file, and `du` is the one that matters for capacity planning.
+
+### Putting the image on tmpfs
+
+For the lowest possible metadata write latency, point `-image` at `/dev/shm` (tmpfs):
+
+```sh
+cp --sparse=always /srv/guoxin.img /dev/shm/guoxin.img
+sudo ./tssniff -image /dev/shm/guoxin.img
+```
+
+Sparse copy (`--sparse=always`) preserves the hole layout, so the tmpfs copy occupies only the pages the original had materialized. A freshly formatted 1 TB image is a few hundred KiB; after a full recording session it grows to about 134 MiB and stops there.
+
+Check the tmpfs size before choosing this path:
+
+```sh
+df -h /dev/shm
+```
+
+tmpfs defaults to half of physical RAM. On a memory-tight SBC, raise the limit via `/etc/fstab` or `mount -o remount,size=512M /dev/shm`. If tmpfs runs out of pages mid-write, the kernel delivers `SIGBUS` to whichever process faults the page. Note that this is *not* the same failure as running out of space on a real disk.
+
+The image on tmpfs does not survive reboot. If you need persistence across reboots, keep a copy on disk and copy it in at startup.
 
 ## Storage behaviour
 
@@ -142,9 +164,9 @@ Three different quantities are involved, and they should not be confused:
 |---|---|---|
 | File logical size | `ls -l`, `stat` | What the host believes it wrote |
 | File allocated size | `du` on the mounted filesystem | FAT cluster chain × cluster size |
-| Backing image size | `du` on the sparse image | Actual bytes on the host disk |
+| Backing image size | `du` on the sparse image | Actual bytes on the host disk or tmpfs |
 
-For a `.ts` recording, the first two reflect what the host sees. The third is unaffected by the size of the recording. Reading a recorded file back from the host side returns zeros; the host itself never reads back a recording while it is being written, so this is not visible to it.
+For a `.ts` recording, the first two reflect what the host sees. The third is unaffected by the size of the recording. Reading a recorded file back from the host side returns zeros unless `-preserve` was set; the host itself never reads back a recording while it is being written, so this is not visible to it.
 
 ## TS extraction
 
@@ -189,6 +211,8 @@ sudo ./gadget.sh start
 sudo ./gadget.sh status
 sudo ./gadget.sh stop
 ```
+
+The backing image path is controlled by `BACKING_IMAGE`. Pointing it at `/dev/shm/guoxin.img` removes disk I/O from the metadata path entirely, which eliminates the last source of latency in the write pipeline.
 
 ## Testing without a USB gadget
 
@@ -239,13 +263,45 @@ GET /stream
 
 The response is a chunked `video/mp2t` stream. Headers are flushed immediately on connect. The body is the sequence of transport stream bytes the host has written, filtered by the rules described in *TS extraction* above.
 
+The hub runs on its own goroutine. `Hub.Broadcast` is a non-blocking enqueue: the FUSE write path never touches the client map, never takes the hub lock, and never waits on an HTTP client. A slow client only fills its own queue; other clients are unaffected.
+
 The HTTP server is independent of the USB gadget. The gadget provides the storage interface to the host; the HTTP server provides the same data to network clients.
+
+## Kernel stability notes
+
+On some ARM64 SBC kernels — notably the MSM8916 mainline and its derivatives — recording sessions can trigger an **RCU stall** that freezes the whole system, including the USB gadget and the FUSE daemon. The symptom is that the STB "suddenly loses track and stops recording" and dmesg fills with lines like:
+
+```
+rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+rcu: rcu_preempt kthread starved for 9319 jiffies!
+rcu: Unless rcu_preempt kthread gets sufficient CPU time, OOM is now expected behavior.
+```
+
+The stack trace of the stuck CPU points at `tick_check_broadcast_expired` inside `cpu_idle_poll`. This is a broadcast-timer delivery bug in the SoC idle path, made much more likely by `CONFIG_PREEMPT_RCU=y`.
+
+This is a **kernel problem**, not a `tssniff` problem. The recorder workload keeps CPUs busy most of the time, so the stall only appears when the system goes idle — which happens exactly when the STB pauses writing (signal loss, tuning change, end of recording). The RCU stall then freezes the USB and FUSE layers, which is what actually causes the STB to abort.
+
+### Workarounds
+
+**Add `cpuidle.off=1` to the kernel command line.** On the openstick, edit `/boot/extlinux/extlinux.conf` (or `/boot/uEnv.txt`) and append it to the `append` line. This keeps CPUs in the shallow idle loop instead of the deep broadcast-timer state. Quick, no rebuild, costs a small amount of power.
+
+**Rebuild the kernel with `CONFIG_PREEMPT_NONE=y`.** This is the recommended fix. In `.config`:
+
+```
+# CONFIG_PREEMPT is not set
+# CONFIG_PREEMPT_RCU is not set
+CONFIG_TREE_RCU=y
+```
+
+A recorder has no need for preemptible RCU; interrupt latency requirements are low.
+
+**Raise the RCU stall timeout as a mitigation.** `CONFIG_RCU_CPU_STALL_TIMEOUT=60` and `CONFIG_RCU_EXP_CPU_STALL_TIMEOUT=60` do not fix the timer delivery, but they stop the kernel from logging itself to death and give the grace period more time to complete.
 
 ## Status
 
 `tssniff` is experimental software for presenting a fake USB storage medium and capturing MPEG-TS writes on Linux.
 
-FAT32 is the default filesystem and is the only one currently supported end-to-end. exFAT can be selected for the fake disk, but the metadata window for exFAT falls back to a fixed 4 MiB region and may misclassify writes on large volumes. Treat exFAT as untested.
+FAT32 is the only filesystem currently supported. The metadata window is derived from the FAT32 boot sector; other filesystem layouts are not handled.
 
 The host's filesystem driver may report the volume as "not properly unmounted" after a recording session, because `tssniff` does not intercept shutdown-time writes from a host that has already stopped writing. This is cosmetic; the filesystem remains consistent.
 
