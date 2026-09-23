@@ -44,10 +44,11 @@ func mountDiskFS(o DiskFSOpts) (*fuse.Server, error) {
 
 	return fs.Mount(o.MountPoint, root, &fs.Options{
 		MountOptions: fuse.MountOptions{
-			AllowOther:  true,
-			DirectMount: true,
-			MaxWrite:    188 * 697,
-			Debug:       o.Debug,
+			AllowOther:    true,
+			DirectMount:   true,
+			MaxWrite:      188 * 697,
+			Debug:         o.Debug,
+			DisableSplice: true,
 		},
 
 		OnAdd: func(ctx context.Context) {
