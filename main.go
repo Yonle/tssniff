@@ -13,11 +13,11 @@ var verbLog bool
 
 func main() {
 	mountPoint := flag.String("mount", "/mnt/tsdisk", "FUSE mount point")
-	image := flag.String("image", "/dev/shm/guoxin.img", "sparse backing image")
+	image := flag.String("image", "/srv/guoxin.img", "sparse backing image")
 	listenAddr := flag.String("listen", ":6969", "HTTP stream listener")
 	filesystem := flag.String("fs", "fat32", "filesystem type")
 	debug := flag.Bool("debug", false, "FUSE debug")
-	preserve := flag.Bool("preserve", false, "preserve TS to /dev/shm")
+	preserve := flag.Bool("preserve", false, "preserve TS to sparse disk")
 	noGadget := flag.Bool("no-gadget", false, "skip USB gadget setup")
 	flag.BoolVar(&verbLog, "verbose", false, "verbose logging")
 	flag.Parse()

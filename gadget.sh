@@ -50,7 +50,7 @@ set -euo pipefail
 # Paths
 ###############################################################################
 
-BACKING_IMAGE="${BACKING_IMAGE:-/dev/shm/guoxin.img}"
+BACKING_IMAGE="${BACKING_IMAGE:-/srv/guoxin.img}"
 
 # FUSE mount point where tssniff exposes disk.img.
 TSSNIFF_MOUNT="${TSSNIFF_MOUNT:-/mnt/tsdisk}"
@@ -944,7 +944,7 @@ Environment:
   FILESYSTEM=fat32
       fat32 (default), vfat, or exfat
 
-  BACKING_IMAGE=/dev/shm/guoxin.img
+  BACKING_IMAGE=/srv/guoxin.img
   TSSNIFF_MOUNT=/mnt/tsdisk
   GADGET_IMAGE=/mnt/tsdisk/disk.img
   TEST_MOUNT=/mnt/guoxin
