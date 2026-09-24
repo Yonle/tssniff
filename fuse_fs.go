@@ -57,7 +57,10 @@ func mountDiskFS(o DiskFSOpts) (*fuse.Server, error) {
 				hub:      o.Hub,
 				tracker:  o.Tracker,
 				preserve: o.Preserve,
+				writeQ:   make(chan diskWriteJob, 2048),
 			}
+
+			go node.writeWorker()
 
 			child := root.NewPersistentInode(
 				ctx,
