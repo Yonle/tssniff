@@ -14,6 +14,20 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
+type diskWriteJob struct {
+	id   uint64
+	seg  ByteRange
+	data []byte
+
+	barrier chan error // nil for normal writes
+}
+
+type cachedWrite struct {
+	id    uint64
+	start uint64
+	data  []byte
+}
+
 type DiskNode struct {
 	fs.Inode
 
@@ -25,29 +39,19 @@ type DiskNode struct {
 
 	detector TSDetector
 
-	/*
-		Serializes everything that changes the logical MPEG-TS stream.
-
-		Without this, an NTFS replay can be interleaved with a live
-		candidate write:
-
-		    replay chunk 1
-		    live write
-		    replay chunk 2
-
-		That can make detector.nextOffset appear to jump backwards.
-	*/
 	tsMu sync.Mutex
 
-	/*
-		The currently selected logical file stream.
-
-		NTFS can expose many ordinary files as RangeCandidate. Once a
-		stream has actually been detected as MPEG-TS, only that stream
-		is allowed to continue feeding the detector until an explicit
-		reset or a newly discovered recording takes over.
-	*/
 	activeTSStream string
+
+	// Async storage path.
+	writeQ chan diskWriteJob
+
+	cacheMu     sync.RWMutex
+	cacheNextID uint64
+	cache       []cachedWrite
+
+	workerMu  sync.RWMutex
+	workerErr error
 }
 
 var (
@@ -102,7 +106,7 @@ func (d *DiskNode) Read(
 
 	data := dest[:int(length)]
 
-	n, err := d.imgFile.ReadAt(data, off)
+	n, err := d.readBacking(data, off)
 	if err != nil && err != io.EOF {
 		return fuse.ReadResultData(nil), toErrno(err)
 	}
@@ -148,6 +152,24 @@ func (d *DiskNode) Write(
 		return 0, 0
 	}
 
+	/*
+		If the asynchronous worker has already failed, stop accepting
+		new writes. Previous writes were already ACKed, so we cannot
+		report their failure retroactively.
+	*/
+	d.workerMu.RLock()
+	workerErr := d.workerErr
+	d.workerMu.RUnlock()
+
+	if workerErr != nil {
+		log.Printf(
+			"write worker previously failed: %v",
+			workerErr,
+		)
+
+		return 0, syscall.EIO
+	}
+
 	segs := d.tracker.Classify(
 		start,
 		uint64(len(data)),
@@ -167,7 +189,8 @@ func (d *DiskNode) Write(
 			continue
 		}
 
-		if seg.Start < start || seg.End > end {
+		if seg.Start < start ||
+			seg.End > end {
 			log.Printf(
 				"invalid tracker range: write=[%d,%d) seg=[%d,%d)",
 				start,
@@ -175,6 +198,7 @@ func (d *DiskNode) Write(
 				seg.Start,
 				seg.End,
 			)
+
 			return 0, syscall.EIO
 		}
 
@@ -183,80 +207,50 @@ func (d *DiskNode) Write(
 
 		part := data[int(rel):int(rel+partLen)]
 
-		switch seg.Kind {
-		case RangeCandidate:
+		/*
+			Copy the bytes NOW.
+
+			FUSE owns the incoming data buffer only for the duration
+			of this Write() call. The background worker must therefore
+			own its own copy.
+		*/
+		id := d.stageWrite(
+			seg.Start,
+			part,
+		)
+
+		jobData := append(
+			[]byte(nil),
+			part...,
+		)
+
+		job := diskWriteJob{
+			id:   id,
+			seg:  seg,
+			data: jobData,
+		}
+
+		select {
+		case d.writeQ <- job:
 			/*
-				Known candidate data has already been classified as
-				file payload.
+				Queued successfully.
 
-				When preserve=false, acknowledge the write to the
-				STB but intentionally do NOT persist it to the sparse
-				backing image.
-
-				When preserve=true, retain the bytes normally.
+				THIS is where Write() now stops waiting for
+				WriteAt()/NTFS/replay/etc.
 			*/
-			if d.preserve {
-				if err := d.writeBacking(
-					part,
-					seg.Start,
-					"CANDIDATE",
-				); err != 0 {
-					return uint32(rel), err
-				}
-			}
 
-			streamID := seg.StreamID
-			if streamID == "" {
-				streamID = "default"
-			}
+		case <-ctx.Done():
+			d.removeCachedWrite(id)
 
-			if verbLog {
-				first := byte(0)
-				if len(part) > 0 {
-					first = part[0]
-				}
-
-				log.Printf(
-					"TS candidate phys=%d len=%d stream=%q first=%02x",
-					seg.Start,
-					len(part),
-					streamID,
-					first,
-				)
-			}
-
-			d.feedCandidate(
-				streamID,
-				seg.StreamOffset,
-				part,
-			)
-
-		case RangeMeta, RangeNormal, RangeUnknown:
-			/*
-				Metadata/unknown writes MUST be persisted.
-
-				For NTFS, an unknown file-data write may later turn out
-				to belong to a newly discovered $DATA extent. Those
-				bytes are temporarily retained here so the tracker can
-				replay them after the MFT reveals their ownership.
-			*/
-			if err := d.writeBacking(
-				part,
-				seg.Start,
-				"DATA",
-			); err != 0 {
-				return uint32(rel), err
-			}
-
-			if err := d.processMetadataWrite(
-				seg.Start,
-				partLen,
-			); err != 0 {
-				return uint32(rel), err
-			}
+			return 0, syscall.EINTR
 		}
 	}
 
+	/*
+		All data has been copied and queued.
+
+		ACK the USB/FUSE write immediately.
+	*/
 	return uint32(len(data)), 0
 }
 
@@ -797,23 +791,230 @@ func (d *DiskNode) Fsync(
 	return d._sync(ctx)
 }
 
+func (d *DiskNode) waitWriteQueue() error {
+	done := make(chan error, 1)
+
+	d.writeQ <- diskWriteJob{
+		barrier: done,
+	}
+
+	return <-done
+}
+
 func (d *DiskNode) _sync(
 	ctx context.Context,
 ) syscall.Errno {
 	start := time.Now()
 
-	err := toErrno(
-		d.imgFile.Sync(),
-	)
+	err := d.waitWriteQueue()
 
 	delay := time.Since(start)
 
 	if delay > 20*time.Millisecond {
 		log.Printf(
-			"slow sync took=%v",
+			"slow queued sync took=%v",
 			delay,
 		)
 	}
 
-	return err
+	return toErrno(err)
+}
+
+func (d *DiskNode) processWriteJob(
+	job diskWriteJob,
+) error {
+	seg := job.seg
+	part := job.data
+
+	switch seg.Kind {
+	case RangeCandidate:
+		/*
+			If preserve=true, persist recording data.
+			Otherwise it remains capture-only.
+		*/
+		if d.preserve {
+			if errno := d.writeBacking(
+				part,
+				seg.Start,
+				"CANDIDATE",
+			); errno != 0 {
+				return errno
+			}
+		}
+
+		streamID := seg.StreamID
+
+		if streamID == "" {
+			streamID = "default"
+		}
+
+		d.feedCandidate(
+			streamID,
+			seg.StreamOffset,
+			part,
+		)
+
+	case RangeMeta, RangeNormal, RangeUnknown:
+		/*
+			Filesystem state is persisted asynchronously.
+
+			Crucially, the bytes are already visible to the STB through
+			the RAM overlay, so the STB doesn't wait for this WriteAt().
+		*/
+		if err := d.writeBacking(
+			part,
+			seg.Start,
+			"DATA",
+		); err != 0 {
+			return err
+		}
+
+		if err := d.processMetadataWrite(
+			seg.Start,
+			uint64(len(part)),
+		); err != 0 {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *DiskNode) writeWorker() {
+	for job := range d.writeQ {
+		/*
+			Flush/Fsync barrier.
+		*/
+		if job.barrier != nil {
+			err := d.imgFile.Sync()
+
+			job.barrier <- err
+			close(job.barrier)
+
+			continue
+		}
+
+		err := d.processWriteJob(job)
+
+		if err != nil {
+			d.workerMu.Lock()
+
+			if d.workerErr == nil {
+				d.workerErr = err
+			}
+
+			d.workerMu.Unlock()
+
+			log.Printf(
+				"async write worker failed: %v",
+				err,
+			)
+		}
+
+		d.removeCachedWrite(job.id)
+	}
+}
+
+func (d *DiskNode) stageWrite(
+	start uint64,
+	data []byte,
+) uint64 {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+
+	id := d.cacheNextID
+	d.cacheNextID++
+
+	cp := append([]byte(nil), data...)
+
+	d.cache = append(
+		d.cache,
+		cachedWrite{
+			id:    id,
+			start: start,
+			data:  cp,
+		},
+	)
+
+	return id
+}
+
+func (d *DiskNode) removeCachedWrite(id uint64) {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+
+	for i := range d.cache {
+		if d.cache[i].id != id {
+			continue
+		}
+
+		copy(
+			d.cache[i:],
+			d.cache[i+1:],
+		)
+
+		d.cache = d.cache[:len(d.cache)-1]
+
+		return
+	}
+}
+
+func (d *DiskNode) readBacking(
+	dst []byte,
+	off int64,
+) (int, error) {
+	n, err := d.imgFile.ReadAt(
+		dst,
+		off,
+	)
+
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+
+	/*
+		Overlay writes which have been acknowledged to the STB but
+		have not reached the backing image yet.
+
+		Later writes win over earlier writes.
+	*/
+	if len(dst) > 0 {
+		reqStart := uint64(off)
+		reqEnd := reqStart + uint64(len(dst))
+
+		d.cacheMu.RLock()
+		defer d.cacheMu.RUnlock()
+
+		for _, w := range d.cache {
+			wStart := w.start
+			wEnd := w.start + uint64(len(w.data))
+
+			if wEnd <= reqStart ||
+				wStart >= reqEnd {
+				continue
+			}
+
+			a := maxU64(reqStart, wStart)
+			b := minU64(reqEnd, wEnd)
+
+			srcStart := a - wStart
+			dstStart := a - reqStart
+
+			copy(
+				dst[int(dstStart):int(dstStart+(b-a))],
+				w.data[int(srcStart):int(srcStart+(b-a))],
+			)
+		}
+	}
+
+	/*
+		ReadAt may return io.EOF with a partial read. The overlay above
+		can still have supplied bytes that were not present in the
+		backing image yet.
+	*/
+	if n < len(dst) {
+		n = len(dst)
+	}
+
+	return n, nil
 }
