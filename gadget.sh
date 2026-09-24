@@ -70,8 +70,9 @@ TEST_MOUNT="${TEST_MOUNT:-/mnt/guoxin}"
 #   fat32
 #   vfat   -> alias for fat32
 #   exfat
+#   ntfs
 #
-FILESYSTEM="${FILESYSTEM:-fat32}"
+FILESYSTEM="${FILESYSTEM:-ntfs}"
 
 TSSNIFF_FILESYSTEM=""
 MOUNT_FILESYSTEM=""
@@ -165,9 +166,19 @@ configure_filesystem() {
             fi
             ;;
 
+        ntfs)
+            TSSNIFF_FILESYSTEM="ntfs"
+            MOUNT_FILESYSTEM="ntfs"
+            BLKID_FILESYSTEM="ntfs"
+
+            if [[ -z "$PARTITION_TYPE" ]]; then
+                PARTITION_TYPE=7
+            fi
+            ;;
+
         *)
             die \
-                "unsupported filesystem: $FILESYSTEM (use fat32, vfat, or exfat)"
+                "unsupported filesystem: $FILESYSTEM (use fat32, vfat, exfat, or ntfs)"
             ;;
     esac
 }
@@ -363,6 +374,23 @@ EOF
 
                 die \
                     "failed to format ${loop}p1 as exFAT"
+            fi
+            ;;
+
+        ntfs)
+            info "formatting partition 1 as NTFS"
+
+            # --quick is mandatory to avoid zeroing the entire sparse image,
+            # which would allocate the full DISK_SIZE on the host disk!
+            if ! mkfs.ntfs \
+                --quick \
+                --label GUOXIN \
+                "${loop}p1"
+            then
+                losetup -d "$loop" 2>/dev/null || true
+
+                die \
+                    "failed to format ${loop}p1 as NTFS"
             fi
             ;;
     esac
@@ -942,7 +970,7 @@ usage:
 Environment:
 
   FILESYSTEM=fat32
-      fat32 (default), vfat, or exfat
+      fat32 (default), vfat, exfat, or ntfs
 
   BACKING_IMAGE=/srv/guoxin.img
   TSSNIFF_MOUNT=/mnt/tsdisk
@@ -974,6 +1002,8 @@ Examples:
   sudo FILESYSTEM=vfat $0 start
 
   sudo FILESYSTEM=exfat $0 start
+
+  sudo FILESYSTEM=ntfs $0 start
 
   sudo FILESYSTEM=fat32 $0 mount
 

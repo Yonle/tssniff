@@ -2,7 +2,9 @@
 
 `tssniff` is a Linux userspace utility that presents a **fake USB storage medium** to a connected host, captures the MPEG-TS data the host writes to it, and makes that data available as an HTTP stream.
 
-The host sees an ordinary MBR-partitioned FAT32 disk and writes to it normally. Filesystem metadata is persisted to a sparse backing image. File data of MPEG-TS recordings is broadcast to HTTP clients instead of being written to disk.
+The host sees an ordinary MBR-partitioned storage device and writes to it normally. `tssniff` tracks the filesystem metadata needed to identify recording file data. MPEG-TS recording data is broadcast over HTTP instead of being permanently written to the sparse backing image by default.
+
+**NTFS is the default filesystem. FAT32 is also supported.**
 
 ## Architecture
 
@@ -16,29 +18,42 @@ Host / STB
     │ /mnt/tsdisk/disk.img  (regular file)
     ▼
  tssniff (FUSE)                     userspace
- ┌──┴──────────────┐
- │                 │
-metadata writes    file data writes
- │                 │
- ▼                 ▼
-sparse image       HTTP /stream
-(guoxin.img)
+ ┌──┴───────────────────────────────┐
+ │                                  │
+ │      filesystem-aware tracker    │
+ │        ┌────────┴────────┐       │
+ │        │                 │       │
+ │      FAT32              NTFS     │
+ │        │                 │       │
+ │ metadata window     MFT/extents  │
+ │        └────────┬────────┘       │
+ │                 ▼                │
+ │             TS detector          │
+ │                 │                │
+ │                 ▼                │
+ │            HTTP /stream          │
+ │                                  │
+ └───────────────┬──────────────────┘
+                 │
+                 ▼
+          sparse backing image
+             (guoxin.img)
 ```
 
-The gadget's LUN points at a file exposed by `tssniff` through FUSE. Every `write()` the host issues against that file lands in `DiskNode.Write`, where the offset is classified:
+The gadget's LUN points at a file exposed by `tssniff` through FUSE. Every `write()` the host issues against that file lands in `DiskNode.Write`, where the offset is classified according to the selected filesystem:
 
-- Writes inside the filesystem metadata window (MBR, boot sector, both FAT tables, root directory) are persisted to the sparse backing image.
-- Writes outside that window are treated as recording data. They are broadcast over HTTP and are **not** written to the sparse image by default. With `-preserve`, they are additionally written to the sparse image at their real offsets, so the recording can be read back later.
+- For **FAT32**, writes in the filesystem metadata area are persisted. Writes outside that area are treated as recording-data candidates and are broadcast instead of being persisted by default.
+- For **NTFS**, metadata is distributed throughout the volume, so physical writes cannot be classified by a single offset boundary. Known file-data extents are treated as recording candidates. A data write that arrives before NTFS metadata identifies its file extent is temporarily persisted to the sparse backing image; once the MFT update makes the extent discoverable, `tssniff` replays those bytes into the TS detector and, with `-preserve` disabled, punches the temporary range back into a hole.
 
-The metadata window is derived from the FAT boot sector at startup, so it scales with the size of the filesystem. A 1 TB FAT32 volume with 64 KB clusters has a metadata window of roughly 134 MiB.
+With `-preserve`, recording data is retained in the sparse backing image at its real disk offsets. Without it, the backing image is kept as a fake storage device rather than an archive of the recording stream.
 
 ## Why FUSE
 
-The two flags that matter are `DirectMount` and `FOPEN_DIRECT_IO`. Together they keep the host's writes on the FUSE callback path, so `DiskNode.Write` sees each SCSI WRITE within microseconds. Without them, the kernel page cache holds dirty pages for up to `dirty_expire_centisecs` (30 s by default), which makes the HTTP stream lag by tens of seconds and breaks the illusion of a live recorder. Both flags are set unconditionally by `mountDiskFS`.
+The two flags that matter are `DirectMount` and `FOPEN_DIRECT_IO`. Together they keep the host's writes on the FUSE callback path, so `DiskNode.Write` sees each SCSI WRITE without relying on the normal delayed dirty-page writeback path. Both flags are set unconditionally by `mountDiskFS`.
 
-This is also why the USB gadget must back onto the FUSE file directly. Putting a loop device on top of a FUSE file reintroduces the block layer between the host and `tssniff`, and with it the same 30-second writeback delay. The gadget's LUN points at `/mnt/tsdisk/disk.img`, not at a loop device.
+This is also why the USB gadget must back onto the FUSE file directly. Putting a loop device on top of a FUSE file reintroduces the block layer between the host and `tssniff`, and with it the buffering/writeback behaviour that this project is specifically trying to avoid. The gadget's LUN points at `/mnt/tsdisk/disk.img`, not at a loop device.
 
-`DisableSplice` is also set. On some kernels — notably certain SBC BSP forks — the kernel's `splice()` path from a FUSE connection into the backing file faults pages in a way tmpfs or the backing filesystem cannot satisfy, delivering `SIGBUS` to the daemon. Disabling splice uses ordinary read/write on the FUSE fd instead, at the cost of one extra memory copy per I/O. Metadata writes are small enough that the cost is negligible.
+`DisableSplice` is also set. On some kernels — notably certain SBC BSP forks — the kernel's `splice()` path from a FUSE connection into the backing file can fault pages in a way the backing filesystem cannot satisfy, delivering `SIGBUS` to the daemon. Disabling splice uses ordinary read/write on the FUSE fd instead, at the cost of one extra memory copy per I/O. Metadata writes are small enough that the cost is negligible.
 
 ## Requirements
 
@@ -52,7 +67,7 @@ This is also why the USB gadget must back onto the FUSE file directly. Putting a
 | `CONFIG_USB_LIBCOMPOSITE` | Backing for configfs gadgets | `zgrep CONFIG_USB_LIBCOMPOSITE /proc/config.gz` |
 | A USB Device Controller | Physical USB peripheral port | `ls /sys/class/udc/` |
 
-On most SBC images these are already present. On generic distributions they are usually modules and load on demand.
+On most SBC images these are already present. On generic distributions they may be modules and load on demand.
 
 ### Userspace
 
@@ -60,14 +75,18 @@ On most SBC images these are already present. On generic distributions they are 
 |---|---|---|
 | `fuse3` | `fusermount3`, `libfuse3` | `tssniff` mount |
 | `util-linux` | `sfdisk`, `losetup`, `blkid` | `gadget.sh prepare-fakedisk` |
-| `dosfstools` | `mkfs.fat` | FAT32 formatting |
+| `dosfstools` | `mkfs.fat` | FAT32 fake-disk preparation |
 | Go ≥ 1.20 | Building `tssniff` | `go build` |
+
+If `gadget.sh` is configured to create an NTFS test image, install the NTFS formatting utility used by that environment (commonly `mkntfs`, provided by an NTFS userspace package on Debian-family systems).
 
 Install on Debian/Ubuntu/Raspberry Pi OS:
 
 ```sh
 sudo apt install fuse3 dosfstools
 ```
+
+For NTFS image preparation, install the distribution's `mkntfs`/NTFS tools package as needed.
 
 ## Build
 
@@ -80,8 +99,20 @@ go build -o tssniff .
 
 ## Usage
 
+`tssniff` defaults to NTFS:
+
 ```sh
 sudo ./tssniff \
+    -image /srv/guoxin.img \
+    -mount /mnt/tsdisk \
+    -listen :6969
+```
+
+To use FAT32 instead:
+
+```sh
+sudo ./tssniff \
+    -fs fat32 \
     -image /srv/guoxin.img \
     -mount /mnt/tsdisk \
     -listen :6969
@@ -91,10 +122,11 @@ Options:
 
 | Option | Default | Description |
 |---|---|---|
-| `-image` | `/srv/guoxin.img` | Sparse backing image for filesystem metadata |
+| `-fs` | `ntfs` | Filesystem tracker to use: `ntfs`, `fat32`, `vfat`, or `exfat` as supported by the tracker layer |
+| `-image` | `/srv/guoxin.img` | Sparse backing image for the fake storage medium |
 | `-mount` | `/mnt/tsdisk` | FUSE mount point |
 | `-listen` | `:6969` | HTTP listen address |
-| `-preserve` | `false` | Also write recording data to the sparse image |
+| `-preserve` | `false` | Retain MPEG-TS recording data in the sparse image |
 | `-no-gadget` | `false` | Skip USB gadget setup (for local testing) |
 | `-debug` | `false` | FUSE debug logging |
 | `-verbose` | `false` | Verbose logging (write classification, TS filtering, tracker state) |
@@ -116,26 +148,97 @@ Response headers are flushed as soon as a client connects, before any data is av
 
 A client that cannot keep up is not disconnected. The hub drops the oldest queued chunk for that client to make room for the newest one. This keeps the live stream flowing and avoids the reconnect stutter that a disconnect-on-slow policy causes. There is no authentication; run the HTTP server on a trusted network.
 
+## Filesystem handling
+
+### FAT32
+
+FAT32 has a relatively simple physical layout for this use case. `tssniff` derives a metadata boundary from the boot sector, covering the reserved sectors, both FAT copies, and the root-directory area used by the fake volume.
+
+Writes outside that boundary are treated as recording-data candidates immediately. This makes the FAT32 path low-latency and requires no filesystem allocation tracking before a recording write can be inspected.
+
+### NTFS
+
+The metadata is distributed throughout the volume, and a recording file's physical clusters may be far away from its logical file offsets.
+
+`tssniff` reads and tracks the MFT to find unnamed nonresident `$DATA` streams belonging to ordinary user files. Each such file is assigned a logical stream ID such as:
+
+```text
+ntfs:35
+```
+
+Physical file extents carry both a physical disk offset and a logical file-stream offset. That lets a fragmented NTFS file be reconstructed in logical order instead of in physical-disk order.
+
+There is an additional timing problem: an NTFS data extent can be written before the MFT metadata update that tells `tssniff` what file owns that extent. For that reason, an as-yet-unclassified NTFS write is temporarily persisted to the sparse backing image. When the MFT update arrives, `tssniff` discovers the new extent, rereads those bytes from the backing image, feeds them to the MPEG-TS detector in logical order, and — with `-preserve=false` — punches the temporary physical range back into a sparse hole.
+
+This delayed-discovery path is the main difference between the NTFS and FAT32 trackers.
+
+## `-preserve` semantics
+
+The sparse backing image is the fake storage medium exposed to the host. It is **not** automatically an MPEG-TS archive.
+
+With the default `-preserve=false`:
+
+```text
+Host write
+    │
+    ├── filesystem metadata ───────► sparse image
+    │
+    └── known recording data ──────► HTTP stream
+                                      │
+                                      └── not retained
+```
+
+For NTFS, an initially unknown write is temporarily stored because the filesystem has not yet told the tracker that the range belongs to a recording:
+
+```text
+NTFS data write
+    │
+    ▼
+temporarily store in sparse image
+    │
+    ▼
+MFT update reveals file extent
+    │
+    ▼
+replay bytes to TS detector
+    │
+    ▼
+punch hole when -preserve=false
+```
+
+With `-preserve=true`, recording-data ranges are kept in the sparse image after they have been captured. This makes later read-back of the recording possible.
+
 ## Disk layout
 
-The fake disk is a standard MBR image with one FAT32 partition:
+The fake disk is an MBR image with one filesystem partition. The filesystem can be NTFS or FAT32 depending on `-fs` and how the backing image was prepared:
 
 ```text
 +---------------------------+
 | MBR                       |  sector 0
 +---------------------------+
-| alignment                 |  LBA 2048
+| alignment / free space    |  typically begins at LBA 2048
 +---------------------------+
 | Partition 1               |
-| FAT32                     |
+| NTFS or FAT32             |
 +---------------------------+
 ```
 
-The backing image is sparse. Its logical size is the full disk size, but its allocated size on disk is only what the metadata window costs. For a 1 TB FAT32 volume, this is roughly 130–150 MiB after a full recording session, regardless of how many gigabytes of MPEG-TS were written.
+The backing image is sparse. Its logical size is the full disk size, while its allocated size reflects only the parts that `tssniff` has actually materialized.
 
-Because the image is sparse and only the metadata window is ever written, the actual RAM or disk cost of the image at any moment is a small fraction of its logical size. `du` on the image reports allocated pages; `ls -l` reports the logical size. They are unrelated for a sparse file, and `du` is the one that matters for capacity planning.
+For FAT32, the normal non-preserve workload primarily materializes the filesystem metadata region.
 
-### Putting the image on tmpfs
+For NTFS, metadata is distributed across the volume and the image may also temporarily materialize newly written recording extents until the MFT reveals them. Those ranges are punched back into holes after replay when `-preserve=false`. Consequently, the exact allocated size is workload-dependent rather than being determined by one fixed metadata-window size.
+
+Because the image is sparse, `du` and `ls -l` report fundamentally different quantities:
+
+```text
+ls -l   → logical file size
+ du -h  → allocated storage actually consumed
+```
+
+They are not expected to match for a sparse image.
+
+## Putting the image on tmpfs
 
 For the lowest possible metadata write latency, point `-image` at `/dev/shm` (tmpfs):
 
@@ -144,7 +247,7 @@ cp --sparse=always /srv/guoxin.img /dev/shm/guoxin.img
 sudo ./tssniff -image /dev/shm/guoxin.img
 ```
 
-Sparse copy (`--sparse=always`) preserves the hole layout, so the tmpfs copy occupies only the pages the original had materialized. A freshly formatted 1 TB image is a few hundred KiB; after a full recording session it grows to about 134 MiB and stops there.
+Sparse copy (`--sparse=always`) preserves the hole layout, so the tmpfs copy initially occupies only the pages that the original image has materialized.
 
 Check the tmpfs size before choosing this path:
 
@@ -152,7 +255,13 @@ Check the tmpfs size before choosing this path:
 df -h /dev/shm
 ```
 
-tmpfs defaults to half of physical RAM. On a memory-tight SBC, raise the limit via `/etc/fstab` or `mount -o remount,size=512M /dev/shm`. If tmpfs runs out of pages mid-write, the kernel delivers `SIGBUS` to whichever process faults the page. Note that this is *not* the same failure as running out of space on a real disk.
+tmpfs commonly defaults to a fraction of physical RAM. On a memory-tight SBC, raise the limit via `/etc/fstab` or, for a temporary change:
+
+```sh
+mount -o remount,size=512M /dev/shm
+```
+
+If tmpfs runs out of pages mid-write, the kernel can deliver `SIGBUS` to whichever process faults the page. This is not the same failure mode as running out of space on a normal block device.
 
 The image on tmpfs does not survive reboot. If you need persistence across reboots, keep a copy on disk and copy it in at startup.
 
@@ -162,28 +271,41 @@ Three different quantities are involved, and they should not be confused:
 
 | Quantity | Reported by | Meaning |
 |---|---|---|
-| File logical size | `ls -l`, `stat` | What the host believes it wrote |
-| File allocated size | `du` on the mounted filesystem | FAT cluster chain × cluster size |
-| Backing image size | `du` on the sparse image | Actual bytes on the host disk or tmpfs |
+| Fake-disk logical size | `ls -l`, `stat` | What the host believes the storage medium contains |
+| Filesystem-visible allocation | Host filesystem tools | What the host believes it has allocated inside the fake volume |
+| Backing image allocation | `du` on the sparse image | Physical storage actually materialized for `guoxin.img` |
 
-For a `.ts` recording, the first two reflect what the host sees. The third is unaffected by the size of the recording. Reading a recorded file back from the host side returns zeros unless `-preserve` was set; the host itself never reads back a recording while it is being written, so this is not visible to it.
+For a `.ts` recording with `-preserve=false`, the recording's file-data blocks are normally not retained permanently in the backing image. On NTFS, they may exist there transiently while waiting for MFT classification.
+
+For `-preserve=true`, recording extents remain materialized in the backing image at their real physical offsets, so the sparse image can grow substantially with the amount of recorded data.
 
 ## TS extraction
 
-Not everything above the metadata window is transport stream. A DVB recorder writes small bookkeeping blocks (file headers, index updates) at fixed offsets inside the recording file. Those writes are above the metadata window and would be broadcast verbatim if classification were purely offset-based.
+A filesystem write is not automatically an MPEG-TS stream. Recorders may perform bookkeeping updates inside recording files, and NTFS may expose multiple ordinary files whose `$DATA` streams are all candidates.
 
-`DiskNode.broadcastTS` keeps only valid transport stream bytes, using three rules:
+The TS detector therefore works on logical file-stream order and uses packet-level validation.
 
-1. **Directional continuity.** A TS write is accepted only if its offset is at or above the frontier of the current stream (the byte after the last accepted TS write).
-   - Writes **below** the frontier are bookkeeping at the file's start. They are dropped silently.
-   - Writes **at** the frontier are normal continuation.
-   - Writes **above** the frontier are the first write of a new recording. The pending buffer is flushed, and the frontier jumps to the new offset.
+### Stream continuity
 
-2. **Directory reset.** A write to the root directory cluster (where the recorder creates or finalises a `.ts` entry) resets the frontier. This ensures the next recording starts with a clean state even if the recorder picks a starting offset below the previous frontier.
+A candidate stream has a logical byte frontier. Writes that arrive below the current frontier are not treated as continuation of the stream. Writes at the frontier continue the stream. A forward gap indicates missing bytes and prevents the detector from blindly stitching unrelated data together.
 
-3. **Stride resync.** Accepted bytes are appended to a small buffer, and only complete runs of 188-byte packets beginning with `0x47` are broadcast. A partial packet at the end of the buffer is retained until the next write completes it.
+For NTFS, this frontier is based on the file's logical stream offset rather than its physical disk offset. That matters when a recording is fragmented across multiple physical extents.
 
-Together these mean the HTTP stream contains only valid, contiguous transport stream packets. Bookkeeping writes, FAT table updates, and directory entry churn never reach clients.
+### Stream selection
+
+NTFS can contain several candidate files at once. Once one logical stream has been positively identified as MPEG-TS, unrelated candidate streams do not get to splice themselves into the active broadcast.
+
+A genuinely new recording can replace the active stream. The NTFS tracker signals this using file-stream discovery/reuse state rather than assuming that the first physical extent of the file must be logical offset zero.
+
+### Directory reset
+
+A write to the root directory metadata can reset the active TS detector. This gives a fresh recording a clean state even when the recorder creates a new file whose physical location is unrelated to the previous recording.
+
+### MPEG-TS validation
+
+Accepted bytes are buffered until complete 188-byte transport-stream packets are available. Detection requires consecutive packet positions beginning with the MPEG-TS sync byte `0x47` and basic header sanity checks. Partial packets at the end of a filesystem write are kept until subsequent bytes arrive.
+
+This prevents ordinary filesystem bookkeeping from being sent directly to HTTP clients.
 
 ## `gadget.sh`
 
@@ -212,7 +334,7 @@ sudo ./gadget.sh status
 sudo ./gadget.sh stop
 ```
 
-The backing image path is controlled by `BACKING_IMAGE`. Pointing it at `/srv/guoxin.img` removes disk I/O from the metadata path entirely, which eliminates the last source of latency in the write pipeline.
+The backing image path is controlled by `BACKING_IMAGE`.
 
 ## Testing without a USB gadget
 
@@ -222,13 +344,17 @@ The full path can be exercised locally without a physical USB port:
 sudo ./tssniff -verbose -no-gadget
 ```
 
-Then, from another shell:
+The filesystem used by the test image must match the tracker selected with `-fs`.
+
+For example, with a FAT32 image:
 
 ```sh
 sudo mount -o loop,offset=1048576,sync /mnt/tsdisk/disk.img /mnt/guoxin
 ```
 
-Writes to the metadata region persist to the sparse image. Writes to file data are broadcast and can be observed at `http://localhost:6969/stream`.
+For NTFS, mount the NTFS test image with the host's normal NTFS filesystem support rather than assuming the FAT32 command above is sufficient.
+
+Writes to filesystem metadata are persisted to the sparse image. Recording-data writes are broadcast and, unless `-preserve` is enabled, are not retained permanently.
 
 `gadget.sh` also provides this workflow:
 
@@ -239,7 +365,7 @@ sudo ./gadget.sh unmount
 sudo ./gadget.sh stop-tssniff
 ```
 
-Do not create a loop device over `/mnt/tsdisk/disk.img` while `tssniff` is running with the gadget active. The loop driver and the USB gadget cannot both own the file without corrupting the classification. Use a second image, or stop the gadget first.
+Do not create a loop device over `/mnt/tsdisk/disk.img` while `tssniff` is running with the gadget active. The loop driver and the USB gadget cannot both safely own the file without corrupting the classification. Use a second image, or stop the gadget first.
 
 ## USB gadget
 
@@ -251,7 +377,7 @@ USB Mass Storage
     └── /mnt/tsdisk/disk.img
 ```
 
-The kernel presents this to the host as a normal removable USB drive. The host performs its own MBR parsing and filesystem mounting; `tssniff` does not interpret the host's filesystem structure beyond identifying the metadata window.
+The kernel presents this to the host as a normal removable USB drive. The host performs its own MBR and filesystem parsing; `tssniff` does not mount that filesystem itself. It observes the resulting storage writes through FUSE and uses the selected tracker to classify them.
 
 ## HTTP server
 
@@ -261,48 +387,49 @@ The kernel presents this to the host as a normal removable USB drive. The host p
 GET /stream
 ```
 
-The response is a chunked `video/mp2t` stream. Headers are flushed immediately on connect. The body is the sequence of transport stream bytes the host has written, filtered by the rules described in *TS extraction* above.
+The response is a chunked `video/mp2t` stream. Headers are flushed immediately on connect. The body is the sequence of transport-stream bytes the host has written and that the TS detector has accepted.
 
-The hub runs on its own goroutine. `Hub.Broadcast` is a non-blocking enqueue: the FUSE write path never touches the client map, never takes the hub lock, and never waits on an HTTP client. A slow client only fills its own queue; other clients are unaffected.
+The hub runs on its own goroutine. `Hub.Broadcast` is a non-blocking enqueue: the FUSE write path never waits for an HTTP client. A slow client only fills its own queue; other clients are unaffected. When a queue is full, the oldest queued chunk for that client is dropped to keep the live stream moving.
 
-The HTTP server is independent of the USB gadget. The gadget provides the storage interface to the host; the HTTP server provides the same data to network clients.
+The HTTP server is independent of the USB gadget. The gadget provides the storage interface to the host; the HTTP server provides the extracted stream to network clients.
 
 ## Kernel stability notes
 
-On some ARM64 SBC kernels — notably the MSM8916 mainline and its derivatives — recording sessions can trigger an **RCU stall** that freezes the whole system, including the USB gadget and the FUSE daemon. The symptom is that the STB "suddenly loses track and stops recording" and dmesg fills with lines like:
+On some ARM64 SBC kernels — notably the MSM8916 mainline and its derivatives — recording sessions can trigger an **RCU stall** that freezes the whole system, including the USB gadget and the FUSE daemon. The symptom is that the STB suddenly stops seeing the storage device and `dmesg` fills with messages such as:
 
-```
+```text
 rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
 rcu: rcu_preempt kthread starved for 9319 jiffies!
 rcu: Unless rcu_preempt kthread gets sufficient CPU time, OOM is now expected behavior.
 ```
 
-The stack trace of the stuck CPU points at `tick_check_broadcast_expired` inside `cpu_idle_poll`. This is a broadcast-timer delivery bug in the SoC idle path, made much more likely by `CONFIG_PREEMPT_RCU=y`.
-
-This is a **kernel problem**, not a `tssniff` problem. The recorder workload keeps CPUs busy most of the time, so the stall only appears when the system goes idle — which happens exactly when the STB pauses writing (signal loss, tuning change, end of recording). The RCU stall then freezes the USB and FUSE layers, which is what actually causes the STB to abort.
+The stack trace of the stuck CPU may point at `tick_check_broadcast_expired` inside `cpu_idle_poll`. This is a kernel idle/timer problem, not an MPEG-TS parser problem.
 
 ### Workarounds
 
-**Add `cpuidle.off=1` to the kernel command line.** On the openstick, edit `/boot/extlinux/extlinux.conf` (or `/boot/uEnv.txt`) and append it to the `append` line. This keeps CPUs in the shallow idle loop instead of the deep broadcast-timer state. Quick, no rebuild, costs a small amount of power.
+**Add `cpuidle.off=1` to the kernel command line.** On the openstick, edit `/boot/extlinux/extlinux.conf` (or `/boot/uEnv.txt`) and append it to the `append` line. This avoids the problematic deeper idle path at the cost of higher idle power consumption.
 
-**Rebuild the kernel with `CONFIG_PREEMPT_NONE=y`.** This is the recommended fix. In `.config`:
+**Rebuild the kernel with `CONFIG_PREEMPT_NONE=y`.** A configuration along these lines avoids preemptible RCU:
 
-```
+```text
 # CONFIG_PREEMPT is not set
 # CONFIG_PREEMPT_RCU is not set
 CONFIG_TREE_RCU=y
 ```
 
-A recorder has no need for preemptible RCU; interrupt latency requirements are low.
-
-**Raise the RCU stall timeout as a mitigation.** `CONFIG_RCU_CPU_STALL_TIMEOUT=60` and `CONFIG_RCU_EXP_CPU_STALL_TIMEOUT=60` do not fix the timer delivery, but they stop the kernel from logging itself to death and give the grace period more time to complete.
+**Raise the RCU stall timeout as a mitigation.** Increasing the stall timeout does not fix the underlying timer problem, but it can reduce the amount of aggressive stall reporting while debugging the kernel.
 
 ## Status
 
 `tssniff` is experimental software for presenting a fake USB storage medium and capturing MPEG-TS writes on Linux.
 
-FAT32 is the only filesystem currently supported. The metadata window is derived from the FAT32 boot sector; other filesystem layouts are not handled.
+**Supported filesystem trackers:**
 
-The host's filesystem driver may report the volume as "not properly unmounted" after a recording session, because `tssniff` does not intercept shutdown-time writes from a host that has already stopped writing. This is cosmetic; the filesystem remains consistent.
+- **NTFS** — default
+- **FAT32**
 
-The TS extraction rules assume a single recording file is being written at a time, that its data clusters are written in monotonically increasing order, and that the host only writes backwards when updating the file's bookkeeping region. A host that interleaves two concurrent recordings, or that seeks backwards to rewrite recorded data, will not be captured correctly. The directional continuity check drops anything that does not continue the current stream rather than risk corrupting it; the directory reset ensures a fresh recording always starts cleanly regardless of where its first cluster sits on the disk.
+The NTFS tracker reconstructs unnamed nonresident `$DATA` streams from MFT information and handles delayed discovery of newly allocated recording extents. The FAT32 tracker uses filesystem geometry from the boot sector and classifies data by the derived metadata boundary.
+
+The host's filesystem driver may report the volume as "not properly unmounted" after a recording session because `tssniff` does not emulate every shutdown-time filesystem transaction exactly. Treat the fake disk as a capture mechanism rather than a general-purpose storage volume.
+
+The TS extraction rules assume a single recording file is being written at a time and that a recording stream can be reconstructed in logical order from the observed filesystem writes. A host that interleaves several active recordings, rewrites large portions of an already-recorded stream, or relies on filesystem features outside the tracker's supported subset may not be captured correctly.

@@ -15,7 +15,7 @@ func main() {
 	mountPoint := flag.String("mount", "/mnt/tsdisk", "FUSE mount point")
 	image := flag.String("image", "/srv/guoxin.img", "sparse backing image")
 	listenAddr := flag.String("listen", ":6969", "HTTP stream listener")
-	filesystem := flag.String("fs", "fat32", "filesystem type")
+	filesystem := flag.String("fs", "ntfs", "filesystem type (supported: ntfs, fat32)")
 	debug := flag.Bool("debug", false, "FUSE debug")
 	preserve := flag.Bool("preserve", false, "preserve TS to sparse disk")
 	noGadget := flag.Bool("no-gadget", false, "skip USB gadget setup")
@@ -45,7 +45,21 @@ func main() {
 	}
 
 	hub := NewHub()
-	tracker := NewFSTracker(*filesystem, part, imgFile)
+	var tracker Tracker
+
+	switch *filesystem {
+	case "ntfs":
+		tracker, err = NewNTFSTracker(part, imgFile)
+		if err != nil {
+			log.Fatalf("initialize NTFS tracker: %v", err)
+		}
+
+	case "fat32", "vfat", "exfat":
+		tracker = NewFSTracker(*filesystem, part, imgFile)
+
+	default:
+		log.Fatalf("unsupported filesystem %q", *filesystem)
+	}
 
 	if verbLog {
 		log.Printf("tracker: metaEnd=%d", tracker.MetadataEnd())
