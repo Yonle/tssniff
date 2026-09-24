@@ -100,7 +100,6 @@ func (h *Hub) Unregister(c *Client) {
 	}
 
 	close(c.done)
-	close(c.out)
 }
 
 func (h *Hub) Close() {
@@ -147,6 +146,8 @@ func (h *Hub) dispatch(data []byte) {
 // It moves items from c.inbox to c.out, dropping the oldest from c.out
 // when the HTTP handler is not reading fast enough.
 func (c *Client) drain() {
+	defer close(c.out)
+
 	for {
 		select {
 		case <-c.done:
