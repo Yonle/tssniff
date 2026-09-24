@@ -9,7 +9,7 @@ type Tracker interface {
 	Classify(start, length uint64) []ByteRange
 	MetadataEnd() uint64
 	InRootDir(off uint64) bool
-	OnMetadataWrite(start, length uint64) []ByteRange
+	OnMetadataWrite(start, length uint64)
 }
 
 type FSTracker struct {
@@ -142,6 +142,4 @@ func (t *FSTracker) Classify(start, length uint64) []ByteRange {
 	}
 }
 
-func (t *FSTracker) OnMetadataWrite(start, length uint64) []ByteRange {
-	return nil
-}
+func (t *FSTracker) OnMetadataWrite(start, length uint64) {}

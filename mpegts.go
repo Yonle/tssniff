@@ -80,30 +80,39 @@ func (d *TSDetector) Feed(
 		A different stream means a different recording/file.
 	*/
 	if d.streamID != streamID {
-		if d.detected {
+		if d.streamID == "" {
+			d.streamID = streamID
+
 			if verbLog {
 				log.Printf(
-					"TS detector: ignore other stream=%q active=%q",
+					"TS detector: new stream=%q",
+					streamID,
+				)
+			}
+		} else if logicalOffset == 0 {
+			if verbLog {
+				log.Printf(
+					"TS detector: new recording stream=%q replacing=%q",
 					streamID,
 					d.streamID,
 				)
 			}
+
+			d.resetLocked()
+			d.streamID = streamID
+		} else {
+			if verbLog {
+				log.Printf(
+					"TS detector: ignore other stream=%q active=%q logical=%d",
+					streamID,
+					d.streamID,
+					logicalOffset,
+				)
+			}
+
 			return
 		}
-		d.resetLocked()
 	}
-
-	if d.streamID == "" {
-		d.streamID = streamID
-
-		if verbLog {
-			log.Printf(
-				"TS detector: new stream=%q",
-				streamID,
-			)
-		}
-	}
-
 	/*
 		Do NOT feed backwards filesystem writes into the MPEG-TS
 		buffer.
