@@ -9,6 +9,7 @@ type Tracker interface {
 	Classify(start, length uint64) []ByteRange
 	MetadataEnd() uint64
 	InRootDir(off uint64) bool
+	OnMetadataWrite(start, length uint64) []ByteRange
 }
 
 type FSTracker struct {
@@ -114,13 +115,33 @@ func (t *FSTracker) Classify(start, length uint64) []ByteRange {
 	}
 	end := start + length
 	if start >= t.metadataEnd {
-		return []ByteRange{{Start: start, End: end, Kind: RangeTS}}
+		return []ByteRange{{
+			Start:        start,
+			End:          end,
+			Kind:         RangeCandidate,
+			StreamID:     "fat32",
+			StreamOffset: start,
+		}}
 	}
 	if end <= t.metadataEnd {
 		return []ByteRange{{Start: start, End: end, Kind: RangeMeta}}
 	}
 	return []ByteRange{
-		{Start: start, End: t.metadataEnd, Kind: RangeMeta},
-		{Start: t.metadataEnd, End: end, Kind: RangeTS},
+		{
+			Start: start,
+			End:   t.metadataEnd,
+			Kind:  RangeMeta,
+		},
+		{
+			Start:        t.metadataEnd,
+			End:          end,
+			Kind:         RangeCandidate,
+			StreamID:     "fat32",
+			StreamOffset: t.metadataEnd,
+		},
 	}
+}
+
+func (t *FSTracker) OnMetadataWrite(start, length uint64) []ByteRange {
+	return nil
 }

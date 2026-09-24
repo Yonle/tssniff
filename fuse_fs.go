@@ -28,7 +28,7 @@ type DiskFSOpts struct {
 	MountPoint string
 	Image      *os.File
 	Hub        *Hub
-	Tracker    *FSTracker
+	Tracker    Tracker
 	Preserve   bool
 	Debug      bool
 }

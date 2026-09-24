@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,12 +19,11 @@ type DiskNode struct {
 	imgFile  *os.File
 	size     uint64
 	hub      *Hub
-	tracker  *FSTracker
+	tracker  Tracker
 	preserve bool
 
-	tsBuf      []byte
-	tsNextOff  uint64
-	tsHaveData bool
+	detector TSDetector
+	tsMu     sync.Mutex
 }
 
 var (
@@ -44,6 +44,7 @@ func (d *DiskNode) Getattr(
 	out.Size = d.size
 	out.Blksize = 512
 	out.Blocks = d.size / 512
+
 	return 0
 }
 
@@ -63,36 +64,35 @@ func (d *DiskNode) Read(
 	if off < 0 {
 		return fuse.ReadResultData(nil), syscall.EINVAL
 	}
+
 	start := uint64(off)
+
 	if start >= d.size || len(dest) == 0 {
 		return fuse.ReadResultData(nil), 0
 	}
+
 	length := uint64(len(dest))
 	if length > d.size-start {
 		length = d.size - start
 	}
+
 	data := dest[:int(length)]
 
 	n, err := d.imgFile.ReadAt(data, off)
 	if err != nil && err != io.EOF {
 		return fuse.ReadResultData(nil), toErrno(err)
 	}
+
 	if n < len(data) {
 		clear(data[n:])
 	}
 
-	metaEnd := d.tracker.MetadataEnd()
-	tsBytes := uint64(0)
-	for i := uint64(0); i < length; i++ {
-		if start+i >= metaEnd {
-			data[i] = 0
-			tsBytes++
-		}
-	}
-
 	if verbLog {
-		log.Printf("read off=%d len=%d metaEnd=%d tsZeroed=%d",
-			start, length, metaEnd, tsBytes)
+		log.Printf(
+			"read off=%d len=%d",
+			start,
+			length,
+		)
 	}
 
 	return fuse.ReadResultData(data), 0
@@ -107,75 +107,171 @@ func (d *DiskNode) Write(
 	if off < 0 {
 		return 0, syscall.EINVAL
 	}
+
 	start := uint64(off)
+
+	if uint64(len(data)) > ^uint64(0)-start {
+		return 0, syscall.EFBIG
+	}
+
 	end := start + uint64(len(data))
+
 	if end > d.size {
 		return 0, syscall.EFBIG
 	}
+
 	if len(data) == 0 {
 		return 0, 0
 	}
 
-	segs := d.tracker.Classify(start, uint64(len(data)))
+	segs := d.tracker.Classify(
+		start,
+		uint64(len(data)),
+	)
 
 	if verbLog {
-		log.Printf("write off=%d len=%d metaEnd=%d segs=%d",
-			start, len(data), d.tracker.MetadataEnd(), len(segs))
+		log.Printf(
+			"write off=%d len=%d segs=%d",
+			start,
+			len(data),
+			len(segs),
+		)
 	}
 
 	for _, seg := range segs {
-		rel := seg.Start - start
-		part := data[rel : rel+(seg.End-seg.Start)]
-
-		if verbLog {
-			kind := "META"
-			if seg.Kind == RangeTS {
-				kind = "TS"
-			}
-			log.Printf("  seg off=%d len=%d kind=%s",
-				seg.Start, len(part), kind)
+		if seg.End <= seg.Start {
+			continue
 		}
 
-		if seg.Kind == RangeTS {
-			if d.preserve {
-				n, err := d.imgFile.WriteAt(part, int64(seg.Start))
-				if err != nil {
-					return uint32(rel), toErrno(err)
-				}
-				if n != len(part) {
-					return uint32(rel + uint64(n)), syscall.EIO
-				}
-			}
-			d.broadcastTS(part, seg.Start)
-		} else {
-			start := time.Now()
-			n, err := d.imgFile.WriteAt(part, int64(seg.Start))
-			dely := time.Since(start)
-			if dely > 20*time.Millisecond {
-				log.Printf("slow META write off=%d len=%d took=%v", seg.Start, len(part), dely)
-			}
-			if err != nil {
-				return uint32(rel), toErrno(err)
-			}
-			if n != len(part) {
-				return uint32(rel + uint64(n)), syscall.EIO
+		if seg.Start < start || seg.End > end {
+			log.Printf(
+				"invalid tracker range: write=[%d,%d) seg=[%d,%d)",
+				start,
+				end,
+				seg.Start,
+				seg.End,
+			)
+			return 0, syscall.EIO
+		}
+
+		rel := seg.Start - start
+		partLen := seg.End - seg.Start
+
+		part := data[int(rel):int(rel+partLen)]
+
+		switch seg.Kind {
+		case RangeCandidate:
+			if err := d.writeBacking(
+				part,
+				seg.Start,
+				"CANDIDATE",
+			); err != 0 {
+				return uint32(rel), err
 			}
 
-			// A write to the root directory means the STB is
-			// creating, updating, or closing a directory entry —
-			// i.e. a new recording is starting.  Reset the TS
-			// continuity state so the first write of the new
-			// recording is accepted regardless of its offset.
+			streamID := seg.StreamID
+			if streamID == "" {
+				streamID = "default"
+			}
+
+			if verbLog {
+				first := byte(0)
+				if len(part) > 0 {
+					first = part[0]
+				}
+
+				log.Printf(
+					"TS candidate phys=%d len=%d stream=%q first=%02x",
+					seg.Start,
+					len(part),
+					streamID,
+					first,
+				)
+			}
+
+			d.feedCandidate(
+				streamID,
+				seg.StreamOffset,
+				part,
+			)
+		case RangeMeta, RangeNormal, RangeUnknown:
+			if err := d.writeBacking(
+				part,
+				seg.Start,
+				"DATA",
+			); err != 0 {
+				return uint32(rel), err
+			}
+
 			if d.tracker.InRootDir(seg.Start) {
 				if verbLog {
-					log.Printf("root dir write at %d: reset TS continuity", seg.Start)
+					log.Printf(
+						"root directory write at %d: reset TS detector",
+						seg.Start,
+					)
 				}
-				d.tsHaveData = false
+
+				d.detector.Reset()
+			}
+
+			newCandidates := d.tracker.OnMetadataWrite(
+				seg.Start,
+				partLen,
+			)
+
+			if len(newCandidates) > 0 {
+				if verbLog {
+					log.Printf(
+						"NTFS: %d newly discovered candidate range(s)",
+						len(newCandidates),
+					)
+				}
+
+				if err := d.replayCandidateRanges(
+					newCandidates,
+				); err != 0 {
+					return uint32(rel), err
+				}
 			}
 		}
 	}
 
 	return uint32(len(data)), 0
+}
+
+func (d *DiskNode) writeBacking(
+	data []byte,
+	off uint64,
+	kind string,
+) syscall.Errno {
+	start := time.Now()
+
+	n, err := d.imgFile.WriteAt(
+		data,
+		int64(off),
+	)
+
+	delay := time.Since(start)
+
+	if delay > 20*time.Millisecond {
+		log.Printf(
+			"slow %s write off=%d len=%d took=%v",
+			kind,
+			off,
+			len(data),
+			delay,
+		)
+	}
+
+	if err != nil {
+		return toErrno(err)
+	}
+
+	if n != len(data) {
+		return syscall.EIO
+	}
+
+	return 0
 }
 
 func (d *DiskNode) Flush(
@@ -197,80 +293,134 @@ func (d *DiskNode) _sync(
 	ctx context.Context,
 ) syscall.Errno {
 	start := time.Now()
-	err := toErrno(d.imgFile.Sync())
-	dely := time.Since(start)
-	if dely > 20*time.Millisecond {
-		log.Printf("slow sync took=%v", dely)
+
+	err := toErrno(
+		d.imgFile.Sync(),
+	)
+
+	delay := time.Since(start)
+
+	if delay > 20*time.Millisecond {
+		log.Printf(
+			"slow sync took=%v",
+			delay,
+		)
 	}
+
 	return err
 }
 
-func (d *DiskNode) broadcastTS(data []byte, off uint64) {
-	if d.tsHaveData {
-		if off < d.tsNextOff {
-			// Backwards write: bookkeeping at the file's start.
-			// Dropping these is what keeps the stream clean.
-			if verbLog {
-				log.Printf("broadcastTS: skip backwards off=%d (frontier %d)",
-					off, d.tsNextOff)
-			}
-			return
-		}
-		if off > d.tsNextOff {
-			// Forward jump: a new recording started.  Flush any
-			// partial packet left from the previous file and start
-			// the buffer over.
-			if verbLog {
-				log.Printf("broadcastTS: forward jump off=%d (was %d), reset",
-					off, d.tsNextOff)
-			}
-			d.tsBuf = d.tsBuf[:0]
-		}
-		// off == tsNextOff: normal continuation, fall through.
-	}
+func (d *DiskNode) replayCandidateRanges(
+	ranges []ByteRange,
+) syscall.Errno {
+	const chunkSize = 1 << 20 // 1 MiB
 
-	d.tsNextOff = off + uint64(len(data))
-	d.tsHaveData = true
-
-	d.tsBuf = append(d.tsBuf, data...)
-
-	for len(d.tsBuf) >= tsPacketSize {
-		if d.tsBuf[0] != tsSyncByte {
-			idx, ok := findMPEGTSOffset(d.tsBuf)
-			if !ok {
-				keep := tsPacketSize - 1
-				if len(d.tsBuf) > keep {
-					copy(d.tsBuf, d.tsBuf[len(d.tsBuf)-keep:])
-					d.tsBuf = d.tsBuf[:keep]
-				}
-				if verbLog {
-					log.Printf("broadcastTS: no resync, kept %d bytes", len(d.tsBuf))
-				}
-				return
-			}
-			d.tsBuf = d.tsBuf[idx:]
-		}
-
-		valid := 0
-		for i := 0; i+tsPacketSize <= len(d.tsBuf); i += tsPacketSize {
-			if d.tsBuf[i] != tsSyncByte {
-				break
-			}
-			valid++
-		}
-		if valid == 0 {
-			d.tsBuf = d.tsBuf[1:]
+	for _, r := range ranges {
+		if r.End <= r.Start {
 			continue
 		}
 
-		n := valid * tsPacketSize
-		payload := make([]byte, n)
-		copy(payload, d.tsBuf[:n])
+		if r.Kind != RangeCandidate {
+			continue
+		}
 
-		d.hub.Broadcast(payload)
+		streamID := r.StreamID
+		if streamID == "" {
+			streamID = "default"
+		}
 
-		rem := len(d.tsBuf) - n
-		copy(d.tsBuf, d.tsBuf[n:])
-		d.tsBuf = d.tsBuf[:rem]
+		remaining := r.End - r.Start
+		phys := r.Start
+		logical := r.StreamOffset
+
+		d.tsMu.Lock()
+		defer d.tsMu.Unlock()
+
+		for remaining > 0 {
+			n := uint64(chunkSize)
+			if n > remaining {
+				n = remaining
+			}
+
+			buf := make([]byte, int(n))
+
+			readN, err := d.imgFile.ReadAt(
+				buf,
+				int64(phys),
+			)
+
+			if err != nil && err != io.EOF {
+				log.Printf(
+					"NTFS replay read failed phys=%d len=%d: %v",
+					phys,
+					n,
+					err,
+				)
+				return toErrno(err)
+			}
+
+			if readN == 0 {
+				break
+			}
+
+			if verbLog {
+				log.Printf(
+					"NTFS replay phys=%d logical=%d len=%d stream=%q",
+					phys,
+					logical,
+					readN,
+					streamID,
+				)
+			}
+			d.detector.Feed(
+				streamID,
+				logical,
+				buf[:readN],
+				func(payload []byte) {
+					if verbLog {
+						log.Printf(
+							"MPEG-TS broadcast len=%d",
+							len(payload),
+						)
+					}
+
+					d.hub.Broadcast(payload)
+				},
+			)
+			phys += uint64(readN)
+			logical += uint64(readN)
+			remaining -= uint64(readN)
+
+			if readN < int(n) {
+				break
+			}
+		}
 	}
+
+	return 0
+}
+
+func (d *DiskNode) feedCandidate(
+	streamID string,
+	streamOffset uint64,
+	data []byte,
+) {
+	d.tsMu.Lock()
+	defer d.tsMu.Unlock()
+
+	d.detector.Feed(
+		streamID,
+		streamOffset,
+		data,
+		func(payload []byte) {
+			if verbLog {
+				log.Printf(
+					"MPEG-TS broadcast len=%d",
+					len(payload),
+				)
+			}
+
+			d.hub.Broadcast(payload)
+		},
+	)
 }

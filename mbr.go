@@ -30,6 +30,11 @@ var mbrFilesystems = map[string]mbrFilesystem{
 		signatureAt: 0x52,
 		signature:   "FAT32   ",
 	},
+	"ntfs": {
+		partTypes:   []byte{0x07},
+		signatureAt: 0x03,
+		signature:   "NTFS    ",
+	},
 }
 
 func findMBRPartition(f *os.File, filesystem string) (Partition, error) {

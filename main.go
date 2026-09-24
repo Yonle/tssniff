@@ -45,7 +45,21 @@ func main() {
 	}
 
 	hub := NewHub()
-	tracker := NewFSTracker(*filesystem, part, imgFile)
+	var tracker Tracker
+
+	switch *filesystem {
+	case "ntfs":
+		tracker, err = NewNTFSTracker(part, imgFile)
+		if err != nil {
+			log.Fatalf("initialize NTFS tracker: %v", err)
+		}
+
+	case "fat32", "vfat", "exfat":
+		tracker = NewFSTracker(*filesystem, part, imgFile)
+
+	default:
+		log.Fatalf("unsupported filesystem %q", *filesystem)
+	}
 
 	if verbLog {
 		log.Printf("tracker: metaEnd=%d", tracker.MetadataEnd())
