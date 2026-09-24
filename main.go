@@ -15,7 +15,7 @@ func main() {
 	mountPoint := flag.String("mount", "/mnt/tsdisk", "FUSE mount point")
 	image := flag.String("image", "/srv/guoxin.img", "sparse backing image")
 	listenAddr := flag.String("listen", ":6969", "HTTP stream listener")
-	filesystem := flag.String("fs", "fat32", "filesystem type")
+	filesystem := flag.String("fs", "ntfs", "filesystem type (supported: ntfs, fat32)")
 	debug := flag.Bool("debug", false, "FUSE debug")
 	preserve := flag.Bool("preserve", false, "preserve TS to sparse disk")
 	noGadget := flag.Bool("no-gadget", false, "skip USB gadget setup")
