@@ -26,52 +26,75 @@ func (r *DiskFS) Getattr(
 
 type DiskFSOpts struct {
 	MountPoint string
-	Image      *os.File
-	Hub        *Hub
-	Tracker    Tracker
-	Preserve   bool
-	Debug      bool
+
+	Image  *os.File
+	SHM    *SHMDisk
+	Writer *DiskWriter
+
+	Hub      *Hub
+	Tracker  Tracker
+	Preserve bool
+	Debug    bool
 }
 
-func mountDiskFS(o DiskFSOpts) (*fuse.Server, error) {
+func mountDiskFS(
+	o DiskFSOpts,
+) (*fuse.Server, error) {
 	st, err := o.Image.Stat()
 	if err != nil {
 		return nil, err
 	}
 
+	if o.SHM == nil {
+		return nil, syscall.EINVAL
+	}
+
+	if o.Writer == nil {
+		return nil, syscall.EINVAL
+	}
+
 	root := &DiskFS{}
 
-	return fs.Mount(o.MountPoint, root, &fs.Options{
-		MountOptions: fuse.MountOptions{
-			AllowOther:    true,
-			DirectMount:   true,
-			MaxWrite:      188 * 697,
-			Debug:         o.Debug,
-			DisableSplice: true,
+	return fs.Mount(
+		o.MountPoint,
+		root,
+		&fs.Options{
+			MountOptions: fuse.MountOptions{
+				AllowOther:    true,
+				DirectMount:   true,
+				MaxWrite:      188 * 697,
+				Debug:         o.Debug,
+				DisableSplice: true,
+			},
+
+			OnAdd: func(ctx context.Context) {
+				node := &DiskNode{
+					imgFile: o.Image,
+					size:    uint64(st.Size()),
+
+					hub:      o.Hub,
+					tracker:  o.Tracker,
+					preserve: o.Preserve,
+
+					shm:    o.SHM,
+					writer: o.Writer,
+				}
+
+				child := root.NewPersistentInode(
+					ctx,
+					node,
+					fs.StableAttr{
+						Mode: syscall.S_IFREG,
+						Ino:  2,
+					},
+				)
+
+				root.AddChild(
+					"disk.img",
+					child,
+					true,
+				)
+			},
 		},
-
-		OnAdd: func(ctx context.Context) {
-			node := &DiskNode{
-				imgFile:  o.Image,
-				size:     uint64(st.Size()),
-				hub:      o.Hub,
-				tracker:  o.Tracker,
-				preserve: o.Preserve,
-				writeQ:   make(chan diskWriteJob, 2048),
-			}
-
-			go node.writeWorker()
-
-			child := root.NewPersistentInode(
-				ctx,
-				node,
-				fs.StableAttr{
-					Mode: syscall.S_IFREG,
-					Ino:  2,
-				},
-			)
-
-			root.AddChild("disk.img", child, true)
-		},
-	})
+	)
 }
