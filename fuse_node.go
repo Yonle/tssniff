@@ -391,29 +391,38 @@ func (d *DiskNode) syncPhysical(
 	start := time.Now()
 
 	/*
-		Sync() queues the barrier in the physical writer after all
-		operations which were logically submitted before it.
+		Insert the barrier while holding logicalMu so it is ordered
+		after all logically submitted writes.
 
-		It may block here because an explicit Fsync is intentionally
-		allowed to wait for the physical disk.
+		IMPORTANT:
+		Release logicalMu BEFORE waiting for physical persistence.
+
+		Otherwise a slow disk blocks the logical filesystem again.
 	*/
 	d.logicalMu.Lock()
-	err := d.writer.Sync(ctx)
+
+	done, err := d.writer.EnqueueSync()
+
 	d.logicalMu.Unlock()
 
-	delay := time.Since(start)
-
-	if delay > 20*time.Millisecond {
-		log.Printf(
-			"slow queued sync took=%v",
-			delay,
-		)
+	if err != nil {
+		return toErrno(err)
 	}
 
-	if err == context.Canceled ||
-		err == context.DeadlineExceeded {
+	select {
+	case err := <-done:
+		delay := time.Since(start)
+
+		if delay > 20*time.Millisecond {
+			log.Printf(
+				"slow queued sync took=%v",
+				delay,
+			)
+		}
+
+		return toErrno(err)
+
+	case <-ctx.Done():
 		return syscall.EINTR
 	}
-
-	return toErrno(err)
 }

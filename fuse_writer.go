@@ -116,6 +116,28 @@ func (w *DiskWriter) Enqueue(
 	return nil
 }
 
+func (w *DiskWriter) EnqueueSync() (<-chan error, error) {
+	done := make(chan error, 1)
+
+	w.queueMu.Lock()
+	defer w.queueMu.Unlock()
+
+	if w.closing {
+		return nil, syscall.EIO
+	}
+
+	w.queue = append(
+		w.queue,
+		diskWriteOp{
+			barrier: done,
+		},
+	)
+
+	w.cond.Signal()
+
+	return done, nil
+}
+
 func (w *DiskWriter) Sync(
 	ctx context.Context,
 ) error {
