@@ -13,6 +13,15 @@ const (
 	// is accepted as a transport stream.
 	minTSPackets = 10
 
+	// Bytes required to validate a complete MPEG-TS candidate.
+	tsDetectionWindow = tsPacketSize * minTSPackets
+
+	// Tail retained after a failed detection attempt.
+	//
+	// Keep one byte less than the full detection window so a future write
+	// can complete a candidate that spans the write boundary.
+	tsDetectionTail = tsDetectionWindow - 1
+
 	// Maximum number of packets emitted in one Hub.Broadcast().
 	maxBroadcastPackets = 128
 )
@@ -103,172 +112,61 @@ IMPORTANT:
 	Backwards data is therefore independently probed for a strong MPEG-TS
 	signature and may become a new sequential segment.
 */
-func (d *TSDetector) Feed(
-	streamID string,
-	logicalOffset uint64,
-	data []byte,
-	emit func([]byte),
-) {
+func (d *TSDetector) Feed(streamID string, logicalOffset uint64, data []byte, emit func([]byte)) {
 	if len(data) == 0 {
 		return
-	}
-
-	if streamID == "" {
-		streamID = "default"
 	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	/*
-		A different stream means a different recording/file.
-	*/
-	if d.streamID != streamID {
-		if d.streamID == "" {
-			d.streamID = streamID
-
-			if verbLog {
-				log.Printf(
-					"TS detector: new stream=%q",
-					streamID,
-				)
-			}
-		} else if logicalOffset == 0 {
-			if verbLog {
-				log.Printf(
-					"TS detector: new recording stream=%q replacing=%q",
-					streamID,
-					d.streamID,
-				)
-			}
-
+	// A different stream starts a new detector session only when it
+	// explicitly begins from offset 0.
+	if d.streamID == "" {
+		d.streamID = streamID
+	} else if streamID != d.streamID {
+		if logicalOffset == 0 {
 			d.resetLocked()
 			d.streamID = streamID
 		} else {
-			if verbLog {
-				log.Printf(
-					"TS detector: ignore other stream=%q active=%q logical=%d",
-					streamID,
-					d.streamID,
-					logicalOffset,
-				)
-			}
-
 			return
 		}
 	}
 
-	/*
-		Determine whether this write belongs to the current sequential
-		frontier.
-	*/
-	if d.haveOffset {
-		/*
-			Backward write.
+	// A backwards write may be the beginning of a new stream segment.
+	// Probe it separately so the currently active detector is not destroyed
+	// by filesystem metadata/bookkeeping writes.
+	if d.haveOffset && logicalOffset < d.nextOffset {
+		d.feedBackwardProbeLocked(streamID, logicalOffset, data, emit)
+		return
+	}
 
-			Do NOT append it to d.buffer.
-
-			Instead, accumulate a separate probe until either:
-
-			    - it contains enough valid MPEG-TS packets
-			    - it becomes discontinuous
-			    - a forward/current write resumes the existing stream
-		*/
-		if logicalOffset < d.nextOffset {
-			if d.feedBackwardProbeLocked(
+	// Physical/logical offset jumped forward.
+	//
+	// IMPORTANT:
+	// If TS was already detected, do NOT clear d.detected.
+	// FAT32 can legitimately write the same logical file through
+	// non-contiguous physical sectors/clusters.
+	if d.haveOffset && logicalOffset > d.nextOffset {
+		if verbLog {
+			log.Printf(
+				"TS detector: forward gap stream=%q off=%d frontier=%d",
 				streamID,
 				logicalOffset,
-				data,
-				emit,
-			) {
-				/*
-					The backward probe became a new sequential
-					segment and was promoted into d.buffer.
-
-					That function already consumed the bytes.
-				*/
-				return
-			}
-
-			/*
-				Still only a probe. Do not disturb the current
-				MPEG-TS segment.
-			*/
-			if verbLog {
-				log.Printf(
-					"TS detector: defer backwards write stream=%q off=%d frontier=%d",
-					streamID,
-					logicalOffset,
-					d.nextOffset,
-				)
-			}
-
-			return
+				d.nextOffset,
+			)
 		}
 
-		/*
-			A forward discontinuity means we don't have the bytes between
-			the current frontier and this write.
-
-			Do not stitch them together into one MPEG-TS stream.
-		*/
-		if logicalOffset > d.nextOffset {
-			if verbLog {
-				log.Printf(
-					"TS detector: forward gap stream=%q off=%d frontier=%d, reset",
-					streamID,
-					logicalOffset,
-					d.nextOffset,
-				)
-			}
-
-			d.buffer = d.buffer[:0]
-			d.detected = false
-
-			/*
-				A forward continuation makes an older backward probe
-				unrelated to the new frontier.
-			*/
-			d.resetProbeLocked()
-		} else {
-			/*
-				Exactly contiguous with the current stream.
-
-				Any incomplete backward probe is no longer a candidate
-				for this sequential segment.
-			*/
-			d.resetProbeLocked()
-		}
-	} else {
-		/*
-			There is no established frontier yet.
-
-			A previous backward probe is irrelevant if this write does
-			not continue it.
-		*/
-		if d.probeHaveOffset {
-			if logicalOffset != d.probeNextOffset ||
-				streamID != d.probeStreamID {
-				d.resetProbeLocked()
-			}
-		}
+		// Any incomplete packet tail belongs to the old region.
+		d.buffer = d.buffer[:0]
+		d.resetProbeLocked()
 	}
 
-	/*
-		Current write belongs to the active sequential stream.
-	*/
 	d.haveOffset = true
 	d.nextOffset = logicalOffset + uint64(len(data))
 
-	d.buffer = append(
-		d.buffer,
-		data...,
-	)
-
-	d.processBufferLocked(
-		streamID,
-		emit,
-	)
+	d.buffer = append(d.buffer, data...)
+	d.processBufferLocked(streamID, emit)
 }
 
 /*
@@ -314,40 +212,40 @@ func (d *TSDetector) feedBackwardProbeLocked(
 			uint64(len(data))
 
 	/*
-		Do not allow a pathological non-TS backwards region to consume
-		unbounded memory.
+		IMPORTANT:
 
-		We only need enough tail data to detect a future 10-packet sync
-		pattern crossing a write boundary.
-	*/
-	const keep =
-		tsPacketSize*minTSPackets - 1
+		Try detection BEFORE trimming.
 
-	if len(d.probe) > keep {
-		drop := len(d.probe) - keep
-
-		copy(
-			d.probe,
-			d.probe[drop:],
-		)
-
-		d.probe = d.probe[:keep]
-
-		/*
-			The exact logical start of the retained probe moved forward.
-		*/
-		d.probeStart += uint64(drop)
-	}
-
-	/*
-		Require the same strong MPEG-TS signature used by normal
-		detection.
+		A complete detection window is 1880 bytes. If we trimmed to
+		1879 bytes first, a sufficiently large backward write would
+		never be able to pass findMPEGTSOffset().
 	*/
 	idx, ok := findMPEGTSOffset(
 		d.probe,
 	)
 
 	if !ok {
+		if verbLog {
+			log.Printf(
+				"TS detector: backward probe waiting stream=%q off=%d len=%d",
+				streamID,
+				d.probeStart,
+				len(d.probe),
+			)
+		}
+
+		if len(d.probe) > tsDetectionTail {
+			drop := len(d.probe) - tsDetectionTail
+
+			copy(
+				d.probe,
+				d.probe[drop:],
+			)
+
+			d.probe = d.probe[:tsDetectionTail]
+			d.probeStart += uint64(drop)
+		}
+
 		return false
 	}
 
@@ -405,6 +303,7 @@ func (d *TSDetector) feedBackwardProbeLocked(
 	}
 
 	d.haveOffset = true
+
 	d.nextOffset =
 		candidateOffset +
 			uint64(len(candidate))
@@ -439,21 +338,21 @@ func (d *TSDetector) processBufferLocked(
 
 		if !ok {
 			/*
-				Keep enough tail bytes so a sync pattern may span
-				two separate filesystem writes.
-			*/
-			const keep =
-				tsPacketSize*minTSPackets - 1
+				Keep the maximum useful tail.
 
-			if len(d.buffer) > keep {
-				drop := len(d.buffer) - keep
+				The search itself happens BEFORE this trim, so a buffer
+				which already contains a complete detection window is not
+				accidentally reduced below the threshold.
+			*/
+			if len(d.buffer) > tsDetectionTail {
+				drop := len(d.buffer) - tsDetectionTail
 
 				copy(
 					d.buffer,
 					d.buffer[drop:],
 				)
 
-				d.buffer = d.buffer[:keep]
+				d.buffer = d.buffer[:tsDetectionTail]
 			}
 
 			return
@@ -488,19 +387,18 @@ func (d *TSDetector) processBufferLocked(
 				/*
 					Keep a tail for possible resynchronisation on the
 					next sequential write.
-				*/
-				const keep =
-					tsPacketSize*minTSPackets - 1
 
-				if len(d.buffer) > keep {
-					drop := len(d.buffer) - keep
+					Again, detection is attempted before trimming.
+				*/
+				if len(d.buffer) > tsDetectionTail {
+					drop := len(d.buffer) - tsDetectionTail
 
 					copy(
 						d.buffer,
 						d.buffer[drop:],
 					)
 
-					d.buffer = d.buffer[:keep]
+					d.buffer = d.buffer[:tsDetectionTail]
 				}
 
 				return
@@ -589,7 +487,9 @@ MPEG-TS:
 	byte 3:
 	    adaptation_field_control must not be 00.
 */
-func validTSPacket(data []byte) bool {
+func validTSPacket(
+	data []byte,
+) bool {
 	if len(data) < tsPacketSize {
 		return false
 	}
@@ -612,14 +512,16 @@ findMPEGTSOffset searches for a valid MPEG-TS sync position.
 A valid candidate must contain minTSPackets consecutive packet positions
 with a 0x47 sync byte and valid MPEG-TS headers.
 */
-func findMPEGTSOffset(data []byte) (int, bool) {
-	need := tsPacketSize * minTSPackets
-
-	if len(data) < need {
+func findMPEGTSOffset(
+	data []byte,
+) (int, bool) {
+	if len(data) < tsDetectionWindow {
 		return 0, false
 	}
 
-	limit := len(data) - need
+	limit :=
+		len(data) -
+			tsDetectionWindow
 
 	for i := 0; i <= limit; i++ {
 		if data[i] != tsSyncByte {
@@ -629,7 +531,9 @@ func findMPEGTSOffset(data []byte) (int, bool) {
 		ok := true
 
 		for j := 0; j < minTSPackets; j++ {
-			off := i + j*tsPacketSize
+			off :=
+				i +
+					j*tsPacketSize
 
 			if !validTSPacket(
 				data[off:],
