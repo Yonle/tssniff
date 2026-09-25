@@ -4,7 +4,7 @@
 
 The host sees an ordinary MBR-partitioned storage device and writes to it normally. `tssniff` tracks the filesystem metadata needed to identify recording file data. MPEG-TS recording data is broadcast over HTTP instead of being permanently written to the sparse backing image by default.
 
-**NTFS is the default filesystem. FAT32 is also supported.**
+**FAT32 is the default filesystem. NTFS is also supported.**
 
 ## Architecture
 
@@ -24,7 +24,7 @@ Host / STB
  │        ┌────────┴────────┐       │
  │        │                 │       │
  │      FAT32              NTFS     │
- │        │                 │       │
+ │     (default)             │       │
  │ metadata window     MFT/extents  │
  │        └────────┬────────┘       │
  │                 ▼                │
@@ -42,8 +42,8 @@ Host / STB
 
 The gadget's LUN points at a file exposed by `tssniff` through FUSE. Every `write()` the host issues against that file lands in `DiskNode.Write`, where the offset is classified according to the selected filesystem:
 
-- For **FAT32**, writes in the filesystem metadata area are persisted. Writes outside that area are treated as recording-data candidates and are broadcast instead of being persisted by default.
-- For **NTFS**, metadata is distributed throughout the volume, so physical writes cannot be classified by a single offset boundary. Known file-data extents are treated as recording candidates. A data write that arrives before NTFS metadata identifies its file extent is temporarily persisted to the sparse backing image; once the MFT update makes the extent discoverable, `tssniff` replays those bytes into the TS detector and, with `-preserve` disabled, punches the temporary range back into a hole.
+* For **FAT32**, writes in the filesystem metadata area are persisted. Writes outside that area are treated as recording-data candidates and are broadcast instead of being persisted by default.
+* For **NTFS**, metadata is distributed throughout the volume, so physical writes cannot be classified by a single offset boundary. Known file-data extents are treated as recording candidates. A data write that arrives before NTFS metadata identifies its file extent is temporarily persisted to the sparse backing image; once the MFT update makes the extent discoverable, `tssniff` replays those bytes into the TS detector and, with `-preserve` disabled, punches the temporary range back into a hole.
 
 With `-preserve`, recording data is retained in the sparse backing image at its real disk offsets. Without it, the backing image is kept as a fake storage device rather than an archive of the recording stream.
 
@@ -59,24 +59,24 @@ This is also why the USB gadget must back onto the FUSE file directly. Putting a
 
 ### Kernel
 
-| Requirement | Purpose | Check |
-|---|---|---|
-| FUSE | Provides `/dev/fuse` and the mount plumbing | `ls /dev/fuse` |
-| `CONFIG_USB_CONFIGFS` | ConfigFS gadget support | `zgrep CONFIG_USB_CONFIGFS /proc/config.gz` |
-| `CONFIG_USB_CONFIGFS_MASS_STORAGE` | Mass storage function | `zgrep CONFIG_USB_CONFIGFS_MASS_STORAGE /proc/config.gz` |
-| `CONFIG_USB_LIBCOMPOSITE` | Backing for configfs gadgets | `zgrep CONFIG_USB_LIBCOMPOSITE /proc/config.gz` |
-| A USB Device Controller | Physical USB peripheral port | `ls /sys/class/udc/` |
+| Requirement                        | Purpose                                     | Check                                                    |
+| ---------------------------------- | ------------------------------------------- | -------------------------------------------------------- |
+| FUSE                               | Provides `/dev/fuse` and the mount plumbing | `ls /dev/fuse`                                           |
+| `CONFIG_USB_CONFIGFS`              | ConfigFS gadget support                     | `zgrep CONFIG_USB_CONFIGFS /proc/config.gz`              |
+| `CONFIG_USB_CONFIGFS_MASS_STORAGE` | Mass storage function                       | `zgrep CONFIG_USB_CONFIGFS_MASS_STORAGE /proc/config.gz` |
+| `CONFIG_USB_LIBCOMPOSITE`          | Backing for configfs gadgets                | `zgrep CONFIG_USB_LIBCOMPOSITE /proc/config.gz`          |
+| A USB Device Controller            | Physical USB peripheral port                | `ls /sys/class/udc/`                                     |
 
 On most SBC images these are already present. On generic distributions they may be modules and load on demand.
 
 ### Userspace
 
-| Package | Provides | Needed by |
-|---|---|---|
-| `fuse3` | `fusermount3`, `libfuse3` | `tssniff` mount |
+| Package      | Provides                     | Needed by                    |
+| ------------ | ---------------------------- | ---------------------------- |
+| `fuse3`      | `fusermount3`, `libfuse3`    | `tssniff` mount              |
 | `util-linux` | `sfdisk`, `losetup`, `blkid` | `gadget.sh prepare-fakedisk` |
-| `dosfstools` | `mkfs.fat` | FAT32 fake-disk preparation |
-| Go ≥ 1.20 | Building `tssniff` | `go build` |
+| `dosfstools` | `mkfs.fat`                   | FAT32 fake-disk preparation  |
+| Go ≥ 1.20    | Building `tssniff`           | `go build`                   |
 
 If `gadget.sh` is configured to create an NTFS test image, install the NTFS formatting utility used by that environment (commonly `mkntfs`, provided by an NTFS userspace package on Debian-family systems).
 
@@ -99,7 +99,7 @@ go build -o tssniff .
 
 ## Usage
 
-`tssniff` defaults to NTFS:
+`tssniff` defaults to FAT32:
 
 ```sh
 sudo ./tssniff \
@@ -108,11 +108,11 @@ sudo ./tssniff \
     -listen :6969
 ```
 
-To use FAT32 instead:
+To use NTFS instead:
 
 ```sh
 sudo ./tssniff \
-    -fs fat32 \
+    -fs ntfs \
     -image /srv/guoxin.img \
     -mount /mnt/tsdisk \
     -listen :6969
@@ -120,16 +120,16 @@ sudo ./tssniff \
 
 Options:
 
-| Option | Default | Description |
-|---|---|---|
-| `-fs` | `ntfs` | Filesystem tracker to use: `ntfs`, `fat32`, `vfat`, or `exfat` as supported by the tracker layer |
-| `-image` | `/srv/guoxin.img` | Sparse backing image for the fake storage medium |
-| `-mount` | `/mnt/tsdisk` | FUSE mount point |
-| `-listen` | `:6969` | HTTP listen address |
-| `-preserve` | `false` | Retain MPEG-TS recording data in the sparse image |
-| `-no-gadget` | `false` | Skip USB gadget setup (for local testing) |
-| `-debug` | `false` | FUSE debug logging |
-| `-verbose` | `false` | Verbose logging (write classification, TS filtering, tracker state) |
+| Option       | Default           | Description                                                                                                |
+| ------------ | ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| `-fs`        | `fat32`           | Filesystem tracker to use: `fat32` (default), `ntfs`, `vfat`, or `exfat` as supported by the tracker layer |
+| `-image`     | `/srv/guoxin.img` | Sparse backing image for the fake storage medium                                                           |
+| `-mount`     | `/mnt/tsdisk`     | FUSE mount point                                                                                           |
+| `-listen`    | `:6969`           | HTTP listen address                                                                                        |
+| `-preserve`  | `false`           | Retain MPEG-TS recording data in the sparse image                                                          |
+| `-no-gadget` | `false`           | Skip USB gadget setup (for local testing)                                                                  |
+| `-debug`     | `false`           | FUSE debug logging                                                                                         |
+| `-verbose`   | `false`           | Verbose logging (write classification, TS filtering, tracker state)                                        |
 
 The captured stream is available at:
 
@@ -152,11 +152,21 @@ A client that cannot keep up is not disconnected. The hub drops the oldest queue
 
 ### FAT32
 
+FAT32 is the default tracker.
+
 FAT32 has a relatively simple physical layout for this use case. `tssniff` derives a metadata boundary from the boot sector, covering the reserved sectors, both FAT copies, and the root-directory area used by the fake volume.
 
 Writes outside that boundary are treated as recording-data candidates immediately. This makes the FAT32 path low-latency and requires no filesystem allocation tracking before a recording write can be inspected.
 
+FAT32 recorders may also reuse earlier physical disk regions, particularly for timeshift-style rolling storage. The MPEG-TS detector therefore does not assume that every lower physical offset is invalid merely because a later write has already advanced the current stream frontier. Backward writes can be independently probed for a new MPEG-TS segment without blindly splicing them into the existing stream.
+
 ### NTFS
+
+NTFS can be selected with:
+
+```sh
+-fs ntfs
+```
 
 The metadata is distributed throughout the volume, and a recording file's physical clusters may be far away from its logical file offsets.
 
@@ -168,7 +178,9 @@ ntfs:35
 
 Physical file extents carry both a physical disk offset and a logical file-stream offset. That lets a fragmented NTFS file be reconstructed in logical order instead of in physical-disk order.
 
-There is an additional timing problem: an NTFS data extent can be written before the MFT metadata update that tells `tssniff` what file owns that extent. For that reason, an as-yet-unclassified NTFS write is temporarily persisted to the sparse backing image. When the MFT update arrives, `tssniff` discovers the new extent, rereads those bytes from the backing image, feeds them to the MPEG-TS detector in logical order, and — with `-preserve=false` — punches the temporary physical range back into a sparse hole.
+There is an additional timing problem: an NTFS data extent can be written before the MFT metadata update that tells `tssniff` what file owns that extent. For that reason, an as-yet-unclassified NTFS write is temporarily persisted to the sparse backing image. When the MFT update arrives, `tssniff` discovers the new extent, rereads those bytes, feeds them to the MPEG-TS detector in logical order, and — with `-preserve=false` — punches the temporary physical range back into a sparse hole.
+
+NTFS writes can also move backwards in a file's logical address space. A backward offset is treated as a discontinuity for sequential MPEG-TS emission, not as proof that the bytes are invalid. The TS detector may independently recognize a backward region as a new MPEG-TS segment.
 
 This delayed-discovery path is the main difference between the NTFS and FAT32 trackers.
 
@@ -210,7 +222,7 @@ With `-preserve=true`, recording-data ranges are kept in the sparse image after 
 
 ## Disk layout
 
-The fake disk is an MBR image with one filesystem partition. The filesystem can be NTFS or FAT32 depending on `-fs` and how the backing image was prepared:
+The fake disk is an MBR image with one filesystem partition. The filesystem can be FAT32 or NTFS depending on `-fs` and how the backing image was prepared:
 
 ```text
 +---------------------------+
@@ -219,7 +231,7 @@ The fake disk is an MBR image with one filesystem partition. The filesystem can 
 | alignment / free space    |  typically begins at LBA 2048
 +---------------------------+
 | Partition 1               |
-| NTFS or FAT32             |
+| FAT32 or NTFS             |
 +---------------------------+
 ```
 
@@ -269,11 +281,11 @@ The image on tmpfs does not survive reboot. If you need persistence across reboo
 
 Three different quantities are involved, and they should not be confused:
 
-| Quantity | Reported by | Meaning |
-|---|---|---|
-| Fake-disk logical size | `ls -l`, `stat` | What the host believes the storage medium contains |
-| Filesystem-visible allocation | Host filesystem tools | What the host believes it has allocated inside the fake volume |
-| Backing image allocation | `du` on the sparse image | Physical storage actually materialized for `guoxin.img` |
+| Quantity                      | Reported by              | Meaning                                                        |
+| ----------------------------- | ------------------------ | -------------------------------------------------------------- |
+| Fake-disk logical size        | `ls -l`, `stat`          | What the host believes the storage medium contains             |
+| Filesystem-visible allocation | Host filesystem tools    | What the host believes it has allocated inside the fake volume |
+| Backing image allocation      | `du` on the sparse image | Physical storage actually materialized for `guoxin.img`        |
 
 For a `.ts` recording with `-preserve=false`, the recording's file-data blocks are normally not retained permanently in the backing image. On NTFS, they may exist there transiently while waiting for MFT classification.
 
@@ -287,9 +299,18 @@ The TS detector therefore works on logical file-stream order and uses packet-lev
 
 ### Stream continuity
 
-A candidate stream has a logical byte frontier. Writes that arrive below the current frontier are not treated as continuation of the stream. Writes at the frontier continue the stream. A forward gap indicates missing bytes and prevents the detector from blindly stitching unrelated data together.
+A candidate stream has a logical byte frontier.
 
-For NTFS, this frontier is based on the file's logical stream offset rather than its physical disk offset. That matters when a recording is fragmented across multiple physical extents.
+A write exactly at the frontier continues the current sequential stream.
+
+A write ahead of the frontier indicates a missing range, so the detector resets its sequential buffer rather than blindly stitching unrelated bytes together.
+
+A write below the frontier is treated as a **backward segment**. It is not appended to the current sequential buffer, but the bytes may be accumulated separately and probed for a strong MPEG-TS signature. This allows timeshift/ring-buffer style reuse of an earlier region without causing ordinary backward filesystem updates to corrupt the active stream.
+
+This rule applies to both FAT32 and NTFS. The meaning of the offset differs between them:
+
+* FAT32 currently uses the physical disk offset.
+* NTFS uses the logical file-stream offset.
 
 ### Stream selection
 
@@ -304,6 +325,8 @@ A write to the root directory metadata can reset the active TS detector. This gi
 ### MPEG-TS validation
 
 Accepted bytes are buffered until complete 188-byte transport-stream packets are available. Detection requires consecutive packet positions beginning with the MPEG-TS sync byte `0x47` and basic header sanity checks. Partial packets at the end of a filesystem write are kept until subsequent bytes arrive.
+
+Backward segments are probed using the same packet-level validation before they are promoted to a new sequential TS segment.
 
 This prevents ordinary filesystem bookkeeping from being sent directly to HTTP clients.
 
@@ -425,10 +448,12 @@ CONFIG_TREE_RCU=y
 
 **Supported filesystem trackers:**
 
-- **NTFS** — default
-- **FAT32**
+* **FAT32** — default
+* **NTFS** — optional via `-fs ntfs`
 
-The NTFS tracker reconstructs unnamed nonresident `$DATA` streams from MFT information and handles delayed discovery of newly allocated recording extents. The FAT32 tracker uses filesystem geometry from the boot sector and classifies data by the derived metadata boundary.
+The FAT32 tracker uses filesystem geometry from the boot sector and classifies data by the derived metadata boundary. The NTFS tracker reconstructs unnamed nonresident `$DATA` streams from MFT information and handles delayed discovery of newly allocated recording extents.
+
+The TS detector treats backward writes as potentially meaningful recording segments rather than automatically discarding them. This accommodates timeshift/ring-buffer behaviour where recording data can reappear at lower physical or logical offsets.
 
 The host's filesystem driver may report the volume as "not properly unmounted" after a recording session because `tssniff` does not emulate every shutdown-time filesystem transaction exactly. Treat the fake disk as a capture mechanism rather than a general-purpose storage volume.
 

@@ -72,7 +72,7 @@ TEST_MOUNT="${TEST_MOUNT:-/mnt/guoxin}"
 #   exfat
 #   ntfs
 #
-FILESYSTEM="${FILESYSTEM:-ntfs}"
+FILESYSTEM="${FILESYSTEM:-fat32}"
 
 TSSNIFF_FILESYSTEM=""
 MOUNT_FILESYSTEM=""
