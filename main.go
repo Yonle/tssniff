@@ -6,10 +6,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 )
 
 var verbLog bool
+
+func init() {
+	debug.SetMaxThreads(64)
+}
 
 func main() {
 	mountPoint := flag.String(

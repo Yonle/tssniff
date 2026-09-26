@@ -136,10 +136,7 @@ func (d *DiskNode) replayCandidateRangesLocked(
 		return nil, 0
 	}
 
-	ordered := append(
-		[]ByteRange(nil),
-		ranges...,
-	)
+	ordered := append([]ByteRange(nil), ranges...)
 
 	sort.Slice(
 		ordered,
@@ -161,6 +158,8 @@ func (d *DiskNode) replayCandidateRangesLocked(
 
 	var punches []ByteRange
 
+	replayed := make([]bool, len(ordered))
+
 	newIDs := make(
 		[]string,
 		0,
@@ -176,14 +175,15 @@ func (d *DiskNode) replayCandidateRangesLocked(
 
 	sort.Strings(newIDs)
 
-	processedNew := make(
-		map[string]struct{},
-		len(newIDs),
-	)
+	/*
+		Try new recordings first so a fresh recording can claim the
+		active TS stream slot over an older one.
 
+		We no longer blind-punch the ranges of a "new" stream. Any
+		punch now only comes from replayCandidateRangeLocked(), which
+		requires an actual MPEG-TS detection for that stream.
+	*/
 	for _, streamID := range newIDs {
-		processedNew[streamID] = struct{}{}
-
 		oldStream := d.activeTSStream
 
 		d.detector.Reset()
@@ -197,10 +197,18 @@ func (d *DiskNode) replayCandidateRangesLocked(
 			)
 		}
 
-		for _, r := range ordered {
+		for i := range ordered {
+			r := ordered[i]
+
 			if r.StreamID != streamID {
 				continue
 			}
+
+			if replayed[i] {
+				continue
+			}
+
+			replayed[i] = true
 
 			newPunches, errno :=
 				d.replayCandidateRangeLocked(r)
@@ -220,49 +228,43 @@ func (d *DiskNode) replayCandidateRangesLocked(
 		}
 	}
 
-	for _, r := range ordered {
+	for i := range ordered {
+		if replayed[i] {
+			continue
+		}
+
+		r := ordered[i]
+
 		streamID := r.StreamID
 
 		if streamID == "" {
 			streamID = "default"
 		}
 
-		if _, isNew := newStreams[streamID]; isNew {
-			if _, alreadyProcessed :=
-				processedNew[streamID]; alreadyProcessed {
-
-				if !d.preserve {
-					punches = append(
-						punches,
-						ByteRange{
-							Start: r.Start,
-							End:   r.End,
-							Kind:  r.Kind,
-						},
-					)
-				}
-			}
-
-			continue
-		}
-
+		/*
+			Once a TS stream is active, do not replay unrelated
+			streams. The previous code punched these ranges blindly,
+			which is exactly what zeroed non-MPEG-TS data (FAT32
+			FSINFO / directory clusters).
+		*/
 		if d.detector.detected &&
 			d.activeTSStream != "" &&
 			streamID != d.activeTSStream {
 
-			if !d.preserve {
-				punches = append(
-					punches,
-					ByteRange{
-						Start: r.Start,
-						End:   r.End,
-						Kind:  r.Kind,
-					},
+			if verbLog {
+				log.Printf(
+					"TS pipeline: skip non-active stream=%q active=%q range=[%d,%d)",
+					streamID,
+					d.activeTSStream,
+					r.Start,
+					r.End,
 				)
 			}
 
 			continue
 		}
+
+		replayed[i] = true
 
 		newPunches, errno :=
 			d.replayCandidateRangeLocked(r)
@@ -371,6 +373,20 @@ func (d *DiskNode) replayCandidateRangeLocked(
 		if readN < int(n) {
 			break
 		}
+	}
+
+	/*
+		Only a range whose exact stream has been confirmed as MPEG-TS
+		may be punched.
+
+		This is the primary defense against zeroing FAT32 metadata
+		(FSINFO sector 1, directory clusters, FAT tables) when the
+		underlying image lives on a FAT32 partition.
+	*/
+	if !d.detector.detected ||
+		d.activeTSStream != streamID {
+
+		return nil, 0
 	}
 
 	/*

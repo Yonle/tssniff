@@ -4,20 +4,27 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 const (
 	// Hub queue: payloads sitting between the FUSE worker and the
 	// dispatch goroutine.  When full, the oldest is dropped.
-	hubQueueDepth = 256
+	hubQueueDepth = 4096
 
 	// Per-client inbox: payloads queued for a client's own drain
 	// goroutine.  When full, the oldest is dropped for that client only.
-	clientInboxDepth = 256
+	clientInboxDepth = 4096
 
 	// Per-client out channel: what the HTTP handler reads from.
 	// When full, the oldest is dropped by the drain goroutine.
-	clientOutDepth = 512
+	clientOutDepth = 8192
+
+	// How long Broadcast blocks before giving up and dropping the
+	// oldest item. This is the knob that trades request latency for
+	// stream integrity. Set to 0 to restore the old drop-immediately
+	// behaviour.
+	broadcastBackpressure = 250 * time.Millisecond
 )
 
 type Client struct {
@@ -46,15 +53,40 @@ func NewHub() *Hub {
 	return h
 }
 
-// Broadcast never blocks.  Enqueue onto the hub queue and return.
-// If the queue is full, the oldest item is dropped to make room.
+// Broadcast never blocks indefinitely. It first tries to enqueue;
+// if the hub queue is full, it applies bounded backpressure before
+// falling back to drop-oldest.
 func (h *Hub) Broadcast(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
+	// Fast path: queue has room.
 	select {
 	case h.queue <- data:
 		return
 	default:
 	}
 
+	// Bounded backpressure: give the dispatcher a chance to drain
+	// before we discard anything.
+	if broadcastBackpressure > 0 {
+		t := time.NewTimer(broadcastBackpressure)
+
+		select {
+		case h.queue <- data:
+			t.Stop()
+			return
+
+		case <-h.done:
+			t.Stop()
+			return
+
+		case <-t.C:
+		}
+	}
+
+	// Still full. Drop the oldest item for the newest one.
 	select {
 	case <-h.queue:
 	default:

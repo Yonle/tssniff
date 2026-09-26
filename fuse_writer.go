@@ -299,12 +299,6 @@ func (w *DiskWriter) process(
 		}
 
 		if !plan.persist {
-			/*
-				Capture-only candidate.
-
-				It does not need physical persistence. Once the whole
-				operation finishes, its SHM generations may be released.
-			*/
 			release = append(
 				release,
 				w.shm.CurrentMatching(
@@ -333,20 +327,27 @@ func (w *DiskWriter) process(
 	/*
 		Now perform deferred physical hole punching.
 
-		This is deliberately after the writes belonging to this logical
-		operation.
-
-		That preserves:
-
-		    write payload
-		    discover MPEG-TS
-		    punch temporary storage
-
-		while ensuring that unrelated RangeNormal/RangeMeta writes never
-		get punched merely because they happened to be nearby.
+		Safety net: never punch over a range that was persisted by the
+		same logical operation. A tracker/detector bug must not be
+		able to erase freshly-written metadata (FAT32 FSINFO,
+		directory clusters, FAT tables, ...).
 	*/
 	for _, plan := range op.punches {
 		if plan.end <= plan.start {
+			continue
+		}
+
+		if overlapsPersisted(
+			plan.start,
+			plan.end,
+			op.writes,
+		) {
+			log.Printf(
+				"skip punch [%d,%d): overlaps persisted write in same op",
+				plan.start,
+				plan.end,
+			)
+
 			continue
 		}
 
@@ -375,10 +376,6 @@ func (w *DiskWriter) process(
 
 	/*
 		Only now release the volatile overlay.
-
-		If another logical write replaced part of the range while the
-		physical worker was busy, ReleaseIfCurrent() leaves that newer
-		generation alive.
 	*/
 	release = coalesceWriterExtents(release)
 
@@ -505,6 +502,24 @@ func errorsIsStale(
 	err error,
 ) bool {
 	return err == ErrSHMStale
+}
+
+func overlapsPersisted(
+	start,
+	end uint64,
+	writes []diskWritePlan,
+) bool {
+	for _, p := range writes {
+		if !p.persist || p.end <= p.start {
+			continue
+		}
+
+		if start < p.end && p.start < end {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (w *DiskWriter) writeBacking(

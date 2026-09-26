@@ -24,6 +24,15 @@ const (
 
 	// Maximum number of packets emitted in one Hub.Broadcast().
 	maxBroadcastPackets = 128
+
+	// Writes arriving slightly out of order are held in a reorder
+	// buffer rather than resetting the detector. FOPEN_DIRECT_IO
+	// does not serialize writes across threads, so small reorderings
+	// are expected from cp / dd / mmap writeback.
+	maxReorderGap = 4 << 20 // 4 MiB
+
+	// Upper bound on the total bytes held by the reorder queue.
+	maxReorderBytes = 32 << 20 // 32 MiB
 )
 
 type TSDetector struct {
@@ -37,6 +46,20 @@ type TSDetector struct {
 	detected bool
 
 	buffer []byte
+
+	/*
+		Out-of-order writes whose predecessor has not arrived yet.
+		Keyed by logicalOffset. Flushed when the gap in front fills.
+	*/
+	pending      map[uint64][]byte
+	pendingBytes int
+
+	/*
+		End of the highest byte already emitted for the current
+		stream. Used to suppress re-emission when a backward probe
+		overlaps data that has already gone out.
+	*/
+	emittedEnd uint64
 
 	/*
 		Backward writes cannot be appended to the current sequential
@@ -82,6 +105,82 @@ func (d *TSDetector) resetLocked() {
 	d.buffer = d.buffer[:0]
 
 	d.resetProbeLocked()
+
+	for k := range d.pending {
+		delete(d.pending, k)
+	}
+	d.pendingBytes = 0
+
+	d.emittedEnd = 0
+}
+
+func (d *TSDetector) dropPendingLocked() {
+	for k := range d.pending {
+		delete(d.pending, k)
+	}
+	d.pendingBytes = 0
+}
+
+func (d *TSDetector) bufferPendingLocked(off uint64, data []byte) {
+	if d.pending == nil {
+		d.pending = make(map[uint64][]byte)
+	}
+
+	if _, exists := d.pending[off]; exists {
+		return
+	}
+
+	cp := make([]byte, len(data))
+	copy(cp, data)
+
+	d.pending[off] = cp
+	d.pendingBytes += len(cp)
+
+	// Bound the reorder buffer by evicting the lowest offset first.
+	for d.pendingBytes > maxReorderBytes {
+		var (
+			oldestOff uint64
+			oldestLen int
+			found     bool
+		)
+
+		for o, b := range d.pending {
+			if !found || o < oldestOff {
+				oldestOff = o
+				oldestLen = len(b)
+				found = true
+			}
+		}
+
+		if !found {
+			break
+		}
+
+		delete(d.pending, oldestOff)
+		d.pendingBytes -= oldestLen
+	}
+}
+
+// flushPendingLocked drains any pending write that starts exactly at
+// d.nextOffset, advancing the frontier until no more can be consumed.
+func (d *TSDetector) flushPendingLocked(
+	streamID string,
+	emit func([]byte),
+) {
+	for {
+		b, ok := d.pending[d.nextOffset]
+		if !ok {
+			return
+		}
+
+		delete(d.pending, d.nextOffset)
+		d.pendingBytes -= len(b)
+
+		d.nextOffset += uint64(len(b))
+		d.buffer = append(d.buffer, b...)
+
+		d.processBufferLocked(streamID, emit)
+	}
 }
 
 func (d *TSDetector) Reset() {
@@ -112,7 +211,12 @@ IMPORTANT:
 	Backwards data is therefore independently probed for a strong MPEG-TS
 	signature and may become a new sequential segment.
 */
-func (d *TSDetector) Feed(streamID string, logicalOffset uint64, data []byte, emit func([]byte)) {
+func (d *TSDetector) Feed(
+	streamID string,
+	logicalOffset uint64,
+	data []byte,
+	emit func([]byte),
+) {
 	if len(data) == 0 {
 		return
 	}
@@ -120,8 +224,6 @@ func (d *TSDetector) Feed(streamID string, logicalOffset uint64, data []byte, em
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// A different stream starts a new detector session only when it
-	// explicitly begins from offset 0.
 	if d.streamID == "" {
 		d.streamID = streamID
 	} else if streamID != d.streamID {
@@ -133,40 +235,54 @@ func (d *TSDetector) Feed(streamID string, logicalOffset uint64, data []byte, em
 		}
 	}
 
-	// A backwards write may be the beginning of a new stream segment.
-	// Probe it separately so the currently active detector is not destroyed
-	// by filesystem metadata/bookkeeping writes.
+	// Backward write: probe separately (overlap-guarded below).
 	if d.haveOffset && logicalOffset < d.nextOffset {
 		d.feedBackwardProbeLocked(streamID, logicalOffset, data, emit)
 		return
 	}
 
-	// Physical/logical offset jumped forward.
-	//
-	// IMPORTANT:
-	// If TS was already detected, do NOT clear d.detected.
-	// FAT32 can legitimately write the same logical file through
-	// non-contiguous physical sectors/clusters.
+	// Forward gap.
 	if d.haveOffset && logicalOffset > d.nextOffset {
+		gap := logicalOffset - d.nextOffset
+
+		if gap <= maxReorderGap {
+			/*
+				Small forward jump. Hold the write until the
+				missing predecessor arrives. This is what keeps
+				cp / mmap-writeback from looking reordered.
+			*/
+			d.bufferPendingLocked(logicalOffset, data)
+			return
+		}
+
 		if verbLog {
 			log.Printf(
-				"TS detector: forward gap stream=%q off=%d frontier=%d",
+				"TS detector: forward gap stream=%q off=%d frontier=%d gap=%d (reset)",
 				streamID,
 				logicalOffset,
 				d.nextOffset,
+				gap,
 			)
 		}
 
-		// Any incomplete packet tail belongs to the old region.
+		/*
+			Genuine forward jump (new recording region). The old
+			frontier is gone, so pending entries keyed to it are
+			meaningless too.
+		*/
 		d.buffer = d.buffer[:0]
 		d.resetProbeLocked()
+		d.dropPendingLocked()
 	}
 
+	// In-order write.
 	d.haveOffset = true
 	d.nextOffset = logicalOffset + uint64(len(data))
 
 	d.buffer = append(d.buffer, data...)
+
 	d.processBufferLocked(streamID, emit)
+	d.flushPendingLocked(streamID, emit)
 }
 
 /*
@@ -296,6 +412,27 @@ func (d *TSDetector) feedBackwardProbeLocked(
 	if idx > 0 {
 		candidate = candidate[idx:]
 		candidateOffset += uint64(idx)
+	}
+
+	if d.emittedEnd > 0 && candidateOffset < d.emittedEnd {
+		drop := d.emittedEnd - candidateOffset
+
+		if drop >= uint64(len(candidate)) {
+			if verbLog {
+				log.Printf(
+					"TS detector: backward probe fully duplicates emitted range stream=%q probe=%d..%d emittedEnd=%d",
+					streamID,
+					d.probeStart,
+					d.probeNextOffset,
+					d.emittedEnd,
+				)
+			}
+
+			return false
+		}
+
+		candidate = candidate[drop:]
+		candidateOffset += drop
 	}
 
 	if len(candidate) == 0 {
@@ -458,6 +595,17 @@ func (d *TSDetector) processBufferLocked(
 				len(payload),
 				validPackets,
 			)
+		}
+
+		/*
+			Record the highest byte that this emission covers so a
+			backward probe cannot later re-emit it.
+		*/
+		emitStart := d.nextOffset - uint64(len(d.buffer))
+		emitEnd := emitStart + uint64(n)
+
+		if emitEnd > d.emittedEnd {
+			d.emittedEnd = emitEnd
 		}
 
 		emit(payload)

@@ -100,13 +100,61 @@ func (d *DiskNode) Read(
 
 	data := dest[:int(length)]
 
-	n, err := d.shm.ReadAt(
-		data,
-		off,
-	)
+	/*
+		SHM is a delta layer. It holds only extents that have not
+		yet been persisted or punched. Every range that has been
+		written through to the sparse image has had its SHM extent
+		released.
 
-	if err != nil && err != io.EOF {
-		return fuse.ReadResultData(nil), toErrno(err)
+		Read SHM first, then fall back to the physical image for
+		whatever SHM does not cover.
+	*/
+	n := 0
+
+	for n < len(data) {
+		chunkOff := off + int64(n)
+
+		chunk := data[n:]
+
+		shmN, shmErr := d.shm.ReadAt(
+			chunk,
+			chunkOff,
+		)
+
+		if shmN > 0 {
+			n += shmN
+
+			if shmErr == nil {
+				continue
+			}
+		}
+
+		/*
+			Either SHM had no extent here, or it errored.
+			Fall through to the physical image for the rest of
+			the requested range.
+		*/
+		physN, physErr := d.imgFile.ReadAt(
+			data[n:],
+			chunkOff,
+		)
+
+		if physN > 0 {
+			n += physN
+		}
+
+		if physErr != nil &&
+			physErr != io.EOF {
+			return fuse.ReadResultData(nil), toErrno(physErr)
+		}
+
+		if physN == 0 {
+			/*
+				Physical image also had nothing. Treat the rest
+				as zeros so the caller sees a coherent block.
+			*/
+			break
+		}
 	}
 
 	if n < len(data) {
