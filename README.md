@@ -428,20 +428,6 @@ rcu: Unless rcu_preempt kthread gets sufficient CPU time, OOM is now expected be
 
 The stack trace of the stuck CPU may point at `tick_check_broadcast_expired` inside `cpu_idle_poll`. This is a kernel idle/timer problem, not an MPEG-TS parser problem.
 
-### Workarounds
-
-**Add `cpuidle.off=1` to the kernel command line.** On the openstick, edit `/boot/extlinux/extlinux.conf` (or `/boot/uEnv.txt`) and append it to the `append` line. This avoids the problematic deeper idle path at the cost of higher idle power consumption.
-
-**Rebuild the kernel with `CONFIG_PREEMPT_NONE=y`.** A configuration along these lines avoids preemptible RCU:
-
-```text
-# CONFIG_PREEMPT is not set
-# CONFIG_PREEMPT_RCU is not set
-CONFIG_TREE_RCU=y
-```
-
-**Raise the RCU stall timeout as a mitigation.** Increasing the stall timeout does not fix the underlying timer problem, but it can reduce the amount of aggressive stall reporting while debugging the kernel.
-
 ## Status
 
 `tssniff` is experimental software for presenting a fake USB storage medium and capturing MPEG-TS writes on Linux.
