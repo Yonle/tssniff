@@ -32,8 +32,8 @@ func main() {
 
 	filesystem := flag.String(
 		"fs",
-		"fat32",
-		"filesystem type (supported: fat32, ntfs)",
+		"ntfs",
+		"filesystem type (supported: ntfs, fat32)",
 	)
 
 	debug := flag.Bool(
