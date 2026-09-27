@@ -369,6 +369,35 @@ func (d *DiskNode) Write(
 
 	punches = coalescePunchRanges(punches)
 
+	for i := range plans {
+		if plans[i].persist {
+			continue
+		}
+
+		covered := false
+
+		for _, p := range punches {
+			if p.Start <= plans[i].start &&
+				p.End >= plans[i].end {
+				covered = true
+				break
+			}
+		}
+
+		if !covered {
+			plans[i].persist = true
+			plans[i].label = "CANDIDATE_PERSIST"
+
+			if verbLog {
+				log.Printf(
+					"candidate not punched; persisting [%d,%d)",
+					plans[i].start,
+					plans[i].end,
+				)
+			}
+		}
+	}
+
 	punchPlans := make(
 		[]diskPunchPlan,
 		0,

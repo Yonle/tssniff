@@ -299,6 +299,20 @@ func (w *DiskWriter) process(
 		}
 
 		if !plan.persist {
+			if !punchCovers(plan, op.punches) {
+				log.Printf(
+					"BUG: non-persisted plan [%d,%d) has no covering punch",
+					plan.start,
+					plan.end,
+				)
+
+				if firstErr == nil {
+					firstErr = syscall.EIO
+				}
+
+				continue
+			}
+
 			release = append(
 				release,
 				w.shm.CurrentMatching(

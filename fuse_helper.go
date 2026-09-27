@@ -514,3 +514,15 @@ func coalescePunchPlans(
 
 	return out
 }
+
+func punchCovers(
+	p diskWritePlan,
+	punches []diskPunchPlan,
+) bool {
+	for _, q := range punches {
+		if q.start <= p.start && q.end >= p.end {
+			return true
+		}
+	}
+	return false
+}
