@@ -447,61 +447,6 @@ func (s *SHMDisk) ReadGeneration(
 	return nil
 }
 
-/*
-ReleaseIfCurrent removes SHM overlay data only when the generation still
-matches.
-
-For normal persisted writes this frees /dev/shm after WriteAt() succeeds.
-
-For replay/hole-punch cleanup it makes sure a newer logical write cannot
-accidentally disappear.
-*/
-func (s *SHMDisk) ReleaseIfCurrent(
-	planned []ShmExtent,
-) error {
-	if len(planned) == 0 {
-		return nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return ErrSHMClosed
-	}
-
-	var firstErr error
-
-	for _, p := range planned {
-		if p.End <= p.Start {
-			continue
-		}
-
-		matches := s.matchGenerationLocked(p)
-
-		for _, m := range matches {
-			if err := s.punchLocked(
-				m.Start,
-				m.End-m.Start,
-			); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-
-				continue
-			}
-
-			s.removeRangeGenerationLocked(
-				m.Start,
-				m.End,
-				m.Gen,
-			)
-		}
-	}
-
-	return firstErr
-}
-
 func (s *SHMDisk) Close() error {
 	s.mu.Lock()
 
@@ -768,6 +713,90 @@ func (s *SHMDisk) punchLocked(
 	}
 
 	return nil
+}
+
+func (s *SHMDisk) ReleaseIfCurrent(
+	planned []ShmExtent,
+) error {
+	if len(planned) == 0 {
+		return nil
+	}
+
+	var toPunch []ShmExtent
+
+	s.mu.Lock()
+
+	if s.closed {
+		s.mu.Unlock()
+		return ErrSHMClosed
+	}
+
+	for _, p := range planned {
+		if p.End <= p.Start {
+			continue
+		}
+
+		matches := s.matchGenerationLocked(p)
+
+		for _, m := range matches {
+			s.removeRangeGenerationLocked(m.Start, m.End, m.Gen)
+			toPunch = append(toPunch, m)
+		}
+	}
+
+	s.mu.Unlock()
+
+	/*
+		Punch each range under a short write lock.
+
+		Verify no newer extent covers the range before punching:
+		StageWrite can overwrite the same tmpfs offsets, and a
+		blind Fallocate would zero the newer bytes.
+
+		Holding the lock across a single Fallocate bounds reader
+		latency to one tmpfs punch, not the whole batch.
+	*/
+	var firstErr error
+
+	for _, m := range toPunch {
+		s.mu.Lock()
+
+		if s.closed {
+			s.mu.Unlock()
+			break
+		}
+
+		if s.anyExtentOverlapsLocked(m.Start, m.End) {
+			s.mu.Unlock()
+			continue
+		}
+
+		err := s.punchLocked(m.Start, m.End-m.Start)
+
+		s.mu.Unlock()
+
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+func (s *SHMDisk) anyExtentOverlapsLocked(
+	start,
+	end uint64,
+) bool {
+	for _, e := range s.extents {
+		if e.End <= start {
+			continue
+		}
+		if e.Start >= end {
+			break
+		}
+		return true
+	}
+	return false
 }
 
 func coalesceShmExtents(

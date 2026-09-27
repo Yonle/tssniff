@@ -128,10 +128,12 @@ func (d *DiskNode) Read(
 
 		chunk := data[n:]
 
+		t0 := time.Now()
 		shmN, shmErr := d.shm.ReadAt(
 			chunk,
 			chunkOff,
 		)
+		shmDur := time.Since(t0)
 
 		if shmN > 0 {
 			n += shmN
@@ -146,10 +148,20 @@ func (d *DiskNode) Read(
 			Fall through to the physical image for the rest of
 			the requested range.
 		*/
+
+		t1 := time.Now()
 		physN, physErr := d.imgFile.ReadAt(
 			data[n:],
 			chunkOff,
 		)
+		physDur := time.Since(t1)
+
+		if shmDur > 100*time.Millisecond || physDur > 100*time.Millisecond {
+			log.Printf(
+				"slow read chunk off=%d len=%d shm=%v phys=%v",
+				chunkOff, len(chunk), shmDur, physDur,
+			)
+		}
 
 		if physN > 0 {
 			n += physN

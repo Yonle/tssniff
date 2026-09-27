@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -14,6 +15,9 @@ const (
 
 	fallocKeepSize  uint32 = 0x01
 	fallocPunchHole uint32 = 0x02
+
+	releaseBatch      = 32
+	punchQueueSoftCap = 256
 )
 
 type diskWritePlan struct {
@@ -61,9 +65,31 @@ type DiskWriter struct {
 	queue   []diskWriteOp
 	cond    *sync.Cond
 
-	closing bool
+	/*
+		Physical punches run on a separate goroutine so the
+		FUSE reader is never blocked behind Fallocate on the
+		sparse image. Unbounded slice with a soft cap; if the
+		puncher falls behind, the cap forces inline execution.
+	*/
+	punchMu    sync.Mutex
+	punchQueue []diskPunchPlan
+	punchCond  *sync.Cond
 
-	wg sync.WaitGroup
+	/*
+		closing is set exactly once, by the first Close() caller.
+
+		After it is true:
+		  - Enqueue / EnqueueSync / Sync return EIO
+		  - pop() and popPunch() exit once their queues drain
+
+		It is read under queueMu in the writer path and under
+		punchMu in the punch path, but stored via CAS so the
+		"first closer" election does not need a lock.
+	*/
+	closing atomic.Bool
+
+	wg      sync.WaitGroup
+	punchWg sync.WaitGroup
 
 	errMu      sync.Mutex
 	pendingErr error
@@ -78,22 +104,20 @@ func NewDiskWriter(
 		shm:  shm,
 	}
 
-	w.cond = sync.NewCond(
-		&w.queueMu,
-	)
+	w.cond = sync.NewCond(&w.queueMu)
+	w.punchCond = sync.NewCond(&w.punchMu)
 
 	w.wg.Add(1)
-
 	go w.worker()
+
+	w.punchWg.Add(1)
+	go w.punchWorker()
 
 	return w
 }
 
 func (w *DiskWriter) Accepting() bool {
-	w.queueMu.Lock()
-	defer w.queueMu.Unlock()
-
-	return !w.closing
+	return !w.closing.Load()
 }
 
 func (w *DiskWriter) Enqueue(
@@ -102,15 +126,11 @@ func (w *DiskWriter) Enqueue(
 	w.queueMu.Lock()
 	defer w.queueMu.Unlock()
 
-	if w.closing {
+	if w.closing.Load() {
 		return syscall.EIO
 	}
 
-	w.queue = append(
-		w.queue,
-		op,
-	)
-
+	w.queue = append(w.queue, op)
 	w.cond.Signal()
 
 	return nil
@@ -122,17 +142,11 @@ func (w *DiskWriter) EnqueueSync() (<-chan error, error) {
 	w.queueMu.Lock()
 	defer w.queueMu.Unlock()
 
-	if w.closing {
+	if w.closing.Load() {
 		return nil, syscall.EIO
 	}
 
-	w.queue = append(
-		w.queue,
-		diskWriteOp{
-			barrier: done,
-		},
-	)
-
+	w.queue = append(w.queue, diskWriteOp{barrier: done})
 	w.cond.Signal()
 
 	return done, nil
@@ -145,19 +159,12 @@ func (w *DiskWriter) Sync(
 
 	w.queueMu.Lock()
 
-	if w.closing {
+	if w.closing.Load() {
 		w.queueMu.Unlock()
-
 		return syscall.EIO
 	}
 
-	w.queue = append(
-		w.queue,
-		diskWriteOp{
-			barrier: done,
-		},
-	)
-
+	w.queue = append(w.queue, diskWriteOp{barrier: done})
 	w.cond.Signal()
 
 	w.queueMu.Unlock()
@@ -172,38 +179,56 @@ func (w *DiskWriter) Sync(
 }
 
 /*
-Close stops accepting new work and drains the physical queue before exiting.
+Close stops accepting new work and drains both the physical write queue
+and the deferred punch queue before returning.
 
 Call this only after FUSE is no longer submitting new writes.
+
+The first caller elects itself via CompareAndSwap and performs the
+drain. Subsequent callers wait for the same drain to finish.
 */
 func (w *DiskWriter) Close() error {
-	done := make(chan error, 1)
+	if !w.closing.CompareAndSwap(false, true) {
+		/*
+			Another Close is already in progress. Wait for it.
 
-	w.queueMu.Lock()
-
-	if w.closing {
-		w.queueMu.Unlock()
+			The first closer will signal both cond variables and
+			wait for both worker WaitGroups; waiting on the same
+			WaitGroups here is sufficient.
+		*/
 		w.wg.Wait()
-
+		w.punchWg.Wait()
 		return nil
 	}
 
-	w.closing = true
+	/*
+		Enqueue a drain barrier after closing is set. Any Enqueue
+		that wins queueMu first still lands before the barrier,
+		because the barrier append also takes queueMu.
 
-	w.queue = append(
-		w.queue,
-		diskWriteOp{
-			barrier: done,
-		},
-	)
+		Broadcast (not Signal) so a worker currently in Wait()
+		wakes regardless of which cond it is parked on.
+	*/
+	done := make(chan error, 1)
 
-	w.cond.Signal()
-
+	w.queueMu.Lock()
+	w.queue = append(w.queue, diskWriteOp{barrier: done})
+	w.cond.Broadcast()
 	w.queueMu.Unlock()
 
 	err := <-done
 
 	w.wg.Wait()
+
+	/*
+		Wake the punch worker so it can exit after draining its
+		own queue.
+	*/
+	w.punchMu.Lock()
+	w.punchCond.Broadcast()
+	w.punchMu.Unlock()
+
+	w.punchWg.Wait()
 
 	return err
 }
@@ -213,7 +238,6 @@ func (w *DiskWriter) worker() {
 
 	for {
 		op, ok := w.pop()
-
 		if !ok {
 			return
 		}
@@ -222,7 +246,6 @@ func (w *DiskWriter) worker() {
 			err := w.disk.Sync()
 
 			pending := w.takePendingError()
-
 			if err == nil {
 				err = pending
 			}
@@ -233,17 +256,10 @@ func (w *DiskWriter) worker() {
 			continue
 		}
 
-		err := w.process(
-			op,
-		)
-
+		err := w.process(op)
 		if err != nil {
 			w.recordError(err)
-
-			log.Printf(
-				"physical writer operation failed: %v",
-				err,
-			)
+			log.Printf("physical writer operation failed: %v", err)
 		}
 	}
 }
@@ -255,23 +271,17 @@ func (w *DiskWriter) pop() (
 	w.queueMu.Lock()
 	defer w.queueMu.Unlock()
 
-	for len(w.queue) == 0 &&
-		!w.closing {
+	for len(w.queue) == 0 && !w.closing.Load() {
 		w.cond.Wait()
 	}
 
-	if len(w.queue) == 0 &&
-		w.closing {
+	if len(w.queue) == 0 && w.closing.Load() {
 		return diskWriteOp{}, false
 	}
 
 	op := w.queue[0]
 
-	copy(
-		w.queue,
-		w.queue[1:],
-	)
-
+	copy(w.queue, w.queue[1:])
 	w.queue[len(w.queue)-1] = diskWriteOp{}
 	w.queue = w.queue[:len(w.queue)-1]
 
@@ -283,126 +293,74 @@ func (w *DiskWriter) process(
 ) error {
 	var (
 		firstErr error
-
-		release []ShmExtent
+		release  []ShmExtent
 	)
 
-	/*
-		Process physical data writes first.
-
-		The SHM overlay remains authoritative until the entire logical
-		operation has completed.
-	*/
 	for _, plan := range op.writes {
 		if plan.end <= plan.start {
 			continue
 		}
 
 		if !plan.persist {
-			if !punchCovers(plan, op.punches) {
-				log.Printf(
-					"BUG: non-persisted plan [%d,%d) has no covering punch",
-					plan.start,
-					plan.end,
-				)
-
-				if firstErr == nil {
-					firstErr = syscall.EIO
-				}
-
-				continue
-			}
-
-			release = append(
-				release,
-				w.shm.CurrentMatching(
-					plan.overlay,
-				)...,
-			)
-
+			/*
+				Capture-only candidate. Its overlay is released
+				after the punch worker has confirmed the physical
+				punch, so the read path keeps seeing the staged
+				bytes until the physical range is actually zeroed.
+			*/
 			continue
 		}
 
-		released, err := w.persistPlan(
-			plan,
-		)
-
-		release = append(
-			release,
-			released...,
-		)
-
-		if err != nil &&
-			firstErr == nil {
+		released, err := w.persistPlan(plan)
+		release = append(release, released...)
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 
 	/*
-		Now perform deferred physical hole punching.
-
-		Safety net: never punch over a range that was persisted by the
-		same logical operation. A tracker/detector bug must not be
-		able to erase freshly-written metadata (FAT32 FSINFO,
-		directory clusters, FAT tables, ...).
+		Hand punches to the background worker. The overlay for
+		these ranges is released by the punch worker after the
+		Fallocate succeeds, not here.
 	*/
 	for _, plan := range op.punches {
 		if plan.end <= plan.start {
 			continue
 		}
 
-		if overlapsPersisted(
-			plan.start,
-			plan.end,
-			op.writes,
-		) {
+		if overlapsPersisted(plan.start, plan.end, op.writes) {
 			log.Printf(
 				"skip punch [%d,%d): overlaps persisted write in same op",
-				plan.start,
-				plan.end,
+				plan.start, plan.end,
 			)
-
+			/*
+				The candidate was persisted, so its SHM overlay
+				belongs to the persist path. Release now.
+			*/
+			release = append(release, plan.overlay...)
 			continue
 		}
 
-		if errno := w.punchHole(
-			plan.start,
-			plan.end-plan.start,
-		); errno != 0 {
-			if firstErr == nil {
-				firstErr = errno
-			}
-
-			continue
-		}
-
-		/*
-			The physical base is now cleaned.
-
-			Only release SHM generations which are still the same ones
-			that existed when the punch was scheduled.
-		*/
-		release = append(
-			release,
-			plan.overlay...,
-		)
+		w.enqueuePunch(plan)
 	}
 
 	/*
-		Only now release the volatile overlay.
+		Batch releases so a large op does not hold the SHM write
+		lock across an unbounded number of Fallocate calls.
 	*/
 	release = coalesceWriterExtents(release)
 
-	if err := w.shm.ReleaseIfCurrent(
-		release,
-	); err != nil {
-		log.Printf(
-			"SHM release failed: %v",
-			err,
-		)
+	for i := 0; i < len(release); i += releaseBatch {
+		j := i + releaseBatch
+		if j > len(release) {
+			j = len(release)
+		}
 
-		if firstErr == nil {
-			firstErr = err
+		if err := w.shm.ReleaseIfCurrent(release[i:j]); err != nil {
+			log.Printf("SHM release failed: %v", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
@@ -412,9 +370,7 @@ func (w *DiskWriter) process(
 func (w *DiskWriter) persistPlan(
 	plan diskWritePlan,
 ) ([]ShmExtent, error) {
-	matches := w.shm.CurrentMatching(
-		plan.overlay,
-	)
+	matches := w.shm.CurrentMatching(plan.overlay)
 
 	if len(matches) == 0 {
 		/*
@@ -425,16 +381,9 @@ func (w *DiskWriter) persistPlan(
 		return nil, nil
 	}
 
-	buf := make(
-		[]byte,
-		writerChunkSize,
-	)
+	buf := make([]byte, writerChunkSize)
 
-	released := make(
-		[]ShmExtent,
-		0,
-		len(matches),
-	)
+	released := make([]ShmExtent, 0, len(matches))
 
 	var firstErr error
 
@@ -443,7 +392,6 @@ func (w *DiskWriter) persistPlan(
 
 		for pos < e.End {
 			n := uint64(writerChunkSize)
-
 			if n > e.End-pos {
 				n = e.End - pos
 			}
@@ -462,10 +410,7 @@ func (w *DiskWriter) persistPlan(
 				A newer write may have arrived while the physical disk
 				was blocked.
 			*/
-			err := w.shm.ReadGeneration(
-				data,
-				chunk,
-			)
+			err := w.shm.ReadGeneration(data, chunk)
 
 			if errorsIsStale(err) {
 				pos += n
@@ -481,11 +426,7 @@ func (w *DiskWriter) persistPlan(
 				continue
 			}
 
-			if errno := w.writeBacking(
-				data,
-				pos,
-				plan.label,
-			); errno != 0 {
+			if errno := w.writeBacking(data, pos, plan.label); errno != 0 {
 				if firstErr == nil {
 					firstErr = errno
 				}
@@ -500,11 +441,7 @@ func (w *DiskWriter) persistPlan(
 				continue
 			}
 
-			released = append(
-				released,
-				chunk,
-			)
-
+			released = append(released, chunk)
 			pos += n
 		}
 	}
@@ -512,9 +449,95 @@ func (w *DiskWriter) persistPlan(
 	return released, firstErr
 }
 
-func errorsIsStale(
-	err error,
-) bool {
+func (w *DiskWriter) enqueuePunch(plan diskPunchPlan) {
+	w.punchMu.Lock()
+
+	if w.closing.Load() {
+		w.punchMu.Unlock()
+		return
+	}
+
+	w.punchQueue = append(w.punchQueue, plan)
+	w.punchCond.Signal()
+
+	/*
+		Soft cap. If the puncher cannot keep up, the writer
+		executes the punch inline. That reintroduces the
+		latency we were trying to avoid, but only under
+		sustained overload, and it is bounded — the queue
+		does not grow without limit.
+	*/
+	overflow := len(w.punchQueue) > punchQueueSoftCap
+
+	w.punchMu.Unlock()
+
+	if overflow {
+		log.Printf("punch queue overflow (%d), punching inline", len(w.punchQueue))
+
+		if err := w.punchInline(plan); err != nil {
+			log.Printf("inline punch failed [%d,%d): %v", plan.start, plan.end, err)
+		}
+	}
+}
+
+func (w *DiskWriter) punchWorker() {
+	defer w.punchWg.Done()
+
+	for {
+		plan, ok := w.popPunch()
+		if !ok {
+			return
+		}
+
+		if err := w.punchInline(plan); err != nil {
+			log.Printf(
+				"async punch failed [%d,%d): %v",
+				plan.start, plan.end, err,
+			)
+		}
+	}
+}
+
+func (w *DiskWriter) popPunch() (diskPunchPlan, bool) {
+	w.punchMu.Lock()
+	defer w.punchMu.Unlock()
+
+	for len(w.punchQueue) == 0 && !w.closing.Load() {
+		w.punchCond.Wait()
+	}
+
+	if len(w.punchQueue) == 0 && w.closing.Load() {
+		return diskPunchPlan{}, false
+	}
+
+	plan := w.punchQueue[0]
+
+	copy(w.punchQueue, w.punchQueue[1:])
+	w.punchQueue[len(w.punchQueue)-1] = diskPunchPlan{}
+	w.punchQueue = w.punchQueue[:len(w.punchQueue)-1]
+
+	return plan, true
+}
+
+func (w *DiskWriter) punchInline(plan diskPunchPlan) error {
+	if errno := w.punchHole(plan.start, plan.end-plan.start); errno != 0 {
+		return errno
+	}
+
+	/*
+		Physical range is now zeroed. Release the SHM overlay
+		generations that existed when the punch was scheduled.
+
+		ReleaseIfCurrent will leave newer generations alone.
+	*/
+	if err := w.shm.ReleaseIfCurrent(plan.overlay); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func errorsIsStale(err error) bool {
 	return err == ErrSHMStale
 }
 
@@ -543,10 +566,7 @@ func (w *DiskWriter) writeBacking(
 ) syscall.Errno {
 	start := time.Now()
 
-	n, err := w.disk.WriteAt(
-		data,
-		int64(off),
-	)
+	n, err := w.disk.WriteAt(data, int64(off))
 
 	delay := time.Since(start)
 
@@ -589,9 +609,7 @@ func (w *DiskWriter) punchHole(
 	if err != nil {
 		log.Printf(
 			"punch hole failed off=%d len=%d: %v",
-			off,
-			length,
-			err,
+			off, length, err,
 		)
 
 		return toErrno(err)
@@ -600,9 +618,7 @@ func (w *DiskWriter) punchHole(
 	return 0
 }
 
-func (w *DiskWriter) recordError(
-	err error,
-) {
+func (w *DiskWriter) recordError(err error) {
 	if err == nil {
 		return
 	}
@@ -625,25 +641,16 @@ func (w *DiskWriter) takePendingError() error {
 	return err
 }
 
-func coalesceWriterExtents(
-	in []ShmExtent,
-) []ShmExtent {
+func coalesceWriterExtents(in []ShmExtent) []ShmExtent {
 	if len(in) == 0 {
 		return nil
 	}
 
-	out := append(
-		[]ShmExtent(nil),
-		in...,
-	)
+	out := append([]ShmExtent(nil), in...)
 
 	sortShmExtents(out)
 
-	merged := make(
-		[]ShmExtent,
-		0,
-		len(out),
-	)
+	merged := make([]ShmExtent, 0, len(out))
 
 	for _, e := range out {
 		if e.End <= e.Start {
@@ -653,17 +660,13 @@ func coalesceWriterExtents(
 		if len(merged) > 0 {
 			last := &merged[len(merged)-1]
 
-			if last.End == e.Start &&
-				last.Gen == e.Gen {
+			if last.End == e.Start && last.Gen == e.Gen {
 				last.End = e.End
 				continue
 			}
 		}
 
-		merged = append(
-			merged,
-			e,
-		)
+		merged = append(merged, e)
 	}
 
 	return merged

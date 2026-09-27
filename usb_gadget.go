@@ -56,15 +56,29 @@ func (g *USBGadget) Setup() error {
 	if err := os.MkdirAll(funcDir, 0755); err != nil {
 		return fmt.Errorf("create mass_storage function: %w", err)
 	}
-	g.writeFile(filepath.Join(funcDir, "stall"), "1")
+	g.writeFile(filepath.Join(funcDir, "stall"), "0")
+	g.writeFile(filepath.Join(funcDir, "num_buffers"), "8")
 
 	// LUN 0: backing block device.
 	lunDir := filepath.Join(funcDir, "lun.0")
 	os.MkdirAll(lunDir, 0755)
+	/*
+	   nofua=1: do not force a synchronous FUA flush on every
+	   SCSI WRITE(10,12).
+
+	   The host's FUA handling parks the function driver inside
+	   f_mass_storage while the backing store completes. That is
+	   exactly the state in which the DWC3 completion event is most
+	   likely to be lost. Removing FUA from the hot path shortens the
+	   window.
+	*/
+	g.writeFile(filepath.Join(lunDir, "nofua"), "1")
 	g.writeFile(filepath.Join(lunDir, "cdrom"), "0")
 	g.writeFile(filepath.Join(lunDir, "ro"), "0")
 	g.writeFile(filepath.Join(lunDir, "removable"), "1")
 	g.writeFile(filepath.Join(lunDir, "file"), g.backingDev)
+
+	g.writeFile(filepath.Join(lunDir, "inquiry_string"), "TSSniff Disk")
 
 	// Link function to config.
 	linkPath := filepath.Join(cfgDir, "mass_storage.0")
