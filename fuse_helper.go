@@ -11,28 +11,24 @@ func (d *DiskNode) feedCandidate(
 	streamID string,
 	logicalOffset uint64,
 	data []byte,
-) {
+) bool {
 	if len(data) == 0 {
-		return
+		return false
 	}
 
 	d.tsMu.Lock()
 	defer d.tsMu.Unlock()
 
-	d.feedCandidateLocked(
-		streamID,
-		logicalOffset,
-		data,
-	)
+	return d.feedCandidateLocked(streamID, logicalOffset, data)
 }
 
 func (d *DiskNode) feedCandidateLocked(
 	streamID string,
 	logicalOffset uint64,
 	data []byte,
-) {
+) bool {
 	if len(data) == 0 {
-		return
+		return false
 	}
 
 	if streamID == "" {
@@ -42,6 +38,7 @@ func (d *DiskNode) feedCandidateLocked(
 	if d.detector.detected &&
 		d.activeTSStream != "" &&
 		streamID != d.activeTSStream {
+
 		if verbLog {
 			log.Printf(
 				"TS pipeline: ignore stream=%q active=%q logical=%d",
@@ -51,7 +48,7 @@ func (d *DiskNode) feedCandidateLocked(
 			)
 		}
 
-		return
+		return false
 	}
 
 	if d.activeTSStream != streamID {
@@ -59,10 +56,7 @@ func (d *DiskNode) feedCandidateLocked(
 		d.activeTSStream = streamID
 
 		if verbLog {
-			log.Printf(
-				"TS pipeline: switch stream=%q",
-				streamID,
-			)
+			log.Printf("TS pipeline: switch stream=%q", streamID)
 		}
 	}
 
@@ -77,7 +71,6 @@ func (d *DiskNode) feedCandidateLocked(
 					len(payload),
 				)
 			}
-
 			d.hub.Broadcast(payload)
 		},
 	)
@@ -85,6 +78,8 @@ func (d *DiskNode) feedCandidateLocked(
 	if d.detector.detected {
 		d.activeTSStream = streamID
 	}
+
+	return d.detector.detected && d.activeTSStream == streamID
 }
 
 func (d *DiskNode) processMetadataWrite(

@@ -338,11 +338,30 @@ func (d *DiskNode) Write(
 				streamID = "default"
 			}
 
-			d.feedCandidate(
+			confirmed := d.feedCandidate(
 				streamID,
 				seg.StreamOffset,
 				part,
 			)
+
+			/*
+				FSTracker has no discovery phase. For NTFS the punch
+				for a TS-confirmed candidate is produced later by
+				processMetadataWrite -> DrainDiscovery; for FAT32 the
+				detection is synchronous, so the punch is generated
+				here, in the same operation that staged the data.
+
+				Non-TS candidates (metadata misclassified as
+				RangeCandidate) fall through to the promotion loop
+				below and are persisted so read-after-write works.
+			*/
+			if !d.preserve && confirmed {
+				punches = append(punches, ByteRange{
+					Start: seg.Start,
+					End:   seg.End,
+					Kind:  seg.Kind,
+				})
+			}
 
 		case RangeMeta, RangeNormal, RangeUnknown:
 			newPunches, errno :=
