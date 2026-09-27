@@ -69,9 +69,7 @@ func mountDiskFS(
 
 			OnAdd: func(ctx context.Context) {
 				node := &DiskNode{
-					imgFile: o.Image,
-					size:    uint64(st.Size()),
-
+					imgFile:  o.Image,
 					hub:      o.Hub,
 					tracker:  o.Tracker,
 					preserve: o.Preserve,
@@ -79,6 +77,8 @@ func mountDiskFS(
 					shm:    o.SHM,
 					writer: o.Writer,
 				}
+
+				node.size.Store(uint64(st.Size()))
 
 				child := root.NewPersistentInode(
 					ctx,

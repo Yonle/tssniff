@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,7 +18,14 @@ type DiskNode struct {
 	fs.Inode
 
 	imgFile *os.File
-	size    uint64
+
+	/*
+		size is read by Getattr and Read on the FUSE goroutine pool,
+		and written by Write when the STB extends the volume.
+		Use atomic access so the extension is visible without a
+		lock on the hot read path.
+	*/
+	size atomic.Uint64
 
 	hub      *Hub
 	tracker  Tracker
@@ -61,10 +69,12 @@ func (d *DiskNode) Getattr(
 	fh fs.FileHandle,
 	out *fuse.AttrOut,
 ) syscall.Errno {
+	size := d.size.Load()
+
 	out.Mode = syscall.S_IFREG | 0644
-	out.Size = d.size
+	out.Size = size
 	out.Blksize = 512
-	out.Blocks = d.size / 512
+	out.Blocks = size / 512
 
 	return 0
 }
@@ -86,16 +96,18 @@ func (d *DiskNode) Read(
 		return fuse.ReadResultData(nil), syscall.EINVAL
 	}
 
+	size := d.size.Load()
+
 	start := uint64(off)
 
-	if start >= d.size || len(dest) == 0 {
+	if start >= size || len(dest) == 0 {
 		return fuse.ReadResultData(nil), 0
 	}
 
 	length := uint64(len(dest))
 
-	if length > d.size-start {
-		length = d.size - start
+	if length > size-start {
+		length = size - start
 	}
 
 	data := dest[:int(length)]
@@ -177,7 +189,25 @@ func (d *DiskNode) Write(
 	fh fs.FileHandle,
 	data []byte,
 	off int64,
-) (uint32, syscall.Errno) {
+) (n uint32, errno syscall.Errno) {
+	/*
+		A panic inside the tracker, detector, or SHM layer must not
+		kill the daemon: the STB would lose its block device
+		mid-operation and its FAT driver would report the volume
+		as corrupt. Convert panics to EIO so at least the daemon
+		survives and subsequent writes can succeed.
+	*/
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf(
+				"PANIC in Write off=%d len=%d: %v",
+				off, len(data), r,
+			)
+			n = 0
+			errno = syscall.EIO
+		}
+	}()
+
 	if off < 0 {
 		return 0, syscall.EINVAL
 	}
@@ -194,8 +224,18 @@ func (d *DiskNode) Write(
 
 	end := start + uint64(len(data))
 
-	if end > d.size {
-		return 0, syscall.EFBIG
+	/*
+		The STB must never see EFBIG. If it writes past the
+		advertised size, extend instead of refusing. The sparse
+		image absorbs it; the alternative is the STB marking the
+		volume as read-only.
+	*/
+	if cur := d.size.Load(); end > cur {
+		log.Printf(
+			"write extends past advertised size: off=%d len=%d old=%d new=%d",
+			start, len(data), cur, end,
+		)
+		d.size.Store(end)
 	}
 
 	select {
@@ -207,86 +247,110 @@ func (d *DiskNode) Write(
 	d.logicalMu.Lock()
 	defer d.logicalMu.Unlock()
 
+	/*
+		Accepting() is only false during teardown. Log it but do
+		not return EIO: the inline fallback below can still
+		serve the write, and an EIO here is indistinguishable
+		from disk failure to the STB.
+	*/
 	if !d.writer.Accepting() {
-		return 0, syscall.EIO
+		log.Printf(
+			"write during writer shutdown off=%d len=%d (inline path)",
+			start, len(data),
+		)
 	}
 
 	/*
 		Stage the whole FUSE write into /dev/shm.
 
-		One generation covers the entire write. Physical plans below
-		refer to subranges of that generation.
+		One generation covers the entire write; the physical
+		plans below refer to subranges of that generation.
+
+		If staging fails, fall back to writing straight through
+		to the sparse image. The STB must see success; a slower
+		path is acceptable, an EIO is not.
 	*/
-	staged, err := d.shm.StageWrite(
-		data,
-		start,
-	)
+	staged, err := d.shm.StageWrite(data, start)
 	if err != nil {
 		log.Printf(
-			"SHM stage failed off=%d len=%d: %v",
-			start,
-			len(data),
-			err,
+			"SHM stage failed off=%d len=%d: %v (falling back to direct write)",
+			start, len(data), err,
 		)
 
-		return 0, toErrno(err)
+		if _, werr := d.imgFile.WriteAt(data, int64(start)); werr != nil {
+			return 0, toErrno(werr)
+		}
+
+		return uint32(len(data)), 0
 	}
 
-	segs := d.tracker.Classify(
-		start,
-		uint64(len(data)),
-	)
+	/*
+		Classify the write.
+	*/
+	segs := d.tracker.Classify(start, uint64(len(data)))
+
+	/*
+		A tracker that returns nothing is a bug, not a normal
+		condition. Default to RangeMeta so the bytes are
+		persisted and the STB can read them back.
+	*/
+	if len(segs) == 0 {
+		log.Printf(
+			"BUG: tracker returned no ranges for write off=%d len=%d; treating as RangeMeta",
+			start, len(data),
+		)
+		segs = []ByteRange{{
+			Start: start,
+			End:   end,
+			Kind:  RangeMeta,
+		}}
+	}
+
+	/*
+		Clip tracker ranges to the write window rather than
+		failing. A tracker with an off-by-one must not be able
+		to take down the STB's filesystem.
+	*/
+	clipped := segs[:0]
+	for _, seg := range segs {
+		if seg.Start < start {
+			seg.Start = start
+		}
+		if seg.End > end {
+			seg.End = end
+		}
+		if seg.End <= seg.Start {
+			continue
+		}
+		clipped = append(clipped, seg)
+	}
+	segs = clipped
 
 	if len(segs) == 0 {
-		_ = d.shm.ReleaseIfCurrent(
-			[]ShmExtent{staged},
-		)
-
-		log.Printf(
-			"tracker returned no ranges for write off=%d len=%d",
-			start,
-			len(data),
-		)
-
-		return 0, syscall.EIO
+		/*
+			Every segment clipped to zero length. Persist the
+			whole write as RangeMeta. Same reasoning as above.
+		*/
+		segs = []ByteRange{{
+			Start: start,
+			End:   end,
+			Kind:  RangeMeta,
+		}}
 	}
 
 	if verbLog {
 		log.Printf(
 			"write off=%d len=%d segs=%d",
-			start,
-			len(data),
-			len(segs),
+			start, len(data), len(segs),
 		)
 	}
 
-	plans := make(
-		[]diskWritePlan,
-		0,
-		len(segs),
-	)
+	/*
+		Build physical write plans for each segment.
+	*/
+	plans := make([]diskWritePlan, 0, len(segs))
 
 	for _, seg := range segs {
-		if seg.End <= seg.Start {
-			continue
-		}
-
-		if seg.Start < start || seg.End > end {
-			_ = d.shm.ReleaseIfCurrent(
-				[]ShmExtent{staged},
-			)
-
-			log.Printf(
-				"invalid tracker range: write=[%d,%d) seg=[%d,%d)",
-				start,
-				end,
-				seg.Start,
-				seg.End,
-			)
-
-			return 0, syscall.EIO
-		}
-
 		persist := true
 		label := "DATA"
 
@@ -295,25 +359,20 @@ func (d *DiskNode) Write(
 			label = "CANDIDATE"
 		}
 
-		plans = append(
-			plans,
-			diskWritePlan{
-				start: seg.Start,
-				end:   seg.End,
+		plans = append(plans, diskWritePlan{
+			start: seg.Start,
+			end:   seg.End,
 
-				persist: persist,
+			persist: persist,
 
-				overlay: []ShmExtent{
-					{
-						Start: seg.Start,
-						End:   seg.End,
-						Gen:   staged.Gen,
-					},
-				},
+			overlay: []ShmExtent{{
+				Start: seg.Start,
+				End:   seg.End,
+				Gen:   staged.Gen,
+			}},
 
-				label: label,
-			},
-		)
+			label: label,
+		})
 	}
 
 	/*
@@ -322,10 +381,6 @@ func (d *DiskNode) Write(
 	var punches []ByteRange
 
 	for _, seg := range segs {
-		if seg.End <= seg.Start {
-			continue
-		}
-
 		a := int(seg.Start - start)
 		b := int(seg.End - start)
 
@@ -345,15 +400,10 @@ func (d *DiskNode) Write(
 			)
 
 			/*
-				FSTracker has no discovery phase. For NTFS the punch
-				for a TS-confirmed candidate is produced later by
-				processMetadataWrite -> DrainDiscovery; for FAT32 the
-				detection is synchronous, so the punch is generated
-				here, in the same operation that staged the data.
-
-				Non-TS candidates (metadata misclassified as
-				RangeCandidate) fall through to the promotion loop
-				below and are persisted so read-after-write works.
+				FSTracker has no discovery phase. For NTFS the
+				punch is produced later by DrainDiscovery; for
+				FAT32 the detection is synchronous, so emit the
+				punch here in the same operation.
 			*/
 			if !d.preserve && confirmed {
 				punches = append(punches, ByteRange{
@@ -364,11 +414,10 @@ func (d *DiskNode) Write(
 			}
 
 		case RangeMeta, RangeNormal, RangeUnknown:
-			newPunches, errno :=
-				d.processMetadataWrite(
-					seg.Start,
-					seg.End-seg.Start,
-				)
+			newPunches, errno := d.processMetadataWrite(
+				seg.Start,
+				seg.End-seg.Start,
+			)
 
 			if errno != 0 {
 				log.Printf(
@@ -379,15 +428,22 @@ func (d *DiskNode) Write(
 				)
 			}
 
-			punches = append(
-				punches,
-				newPunches...,
-			)
+			punches = append(punches, newPunches...)
 		}
 	}
 
 	punches = coalescePunchRanges(punches)
 
+	/*
+		Promote any candidate that is not covered by a punch.
+
+		The original design assumed every RangeCandidate was
+		either punched (physical zeroed) or persisted. The
+		detector guard and the FAT32 punch path above ensure
+		that TS-confirmed candidates are punched. Anything left
+		is a candidate that was not confirmed as MPEG-TS;
+		persist it so read-after-write still works for the STB.
+	*/
 	for i := range plans {
 		if plans[i].persist {
 			continue
@@ -417,6 +473,9 @@ func (d *DiskNode) Write(
 		}
 	}
 
+	/*
+		Build punch plans from the coalesced punch ranges.
+	*/
 	punchPlans := make(
 		[]diskPunchPlan,
 		0,
@@ -442,25 +501,32 @@ func (d *DiskNode) Write(
 		)
 	}
 
+	op := diskWriteOp{
+		writes:  plans,
+		punches: coalescePunchPlans(punchPlans),
+	}
+
 	/*
-		Only metadata goes into the physical queue.
+		Enqueue for asynchronous physical persistence.
+
+		If the writer is shutting down, persist inline instead
+		of returning an error the STB cannot recover from.
+		Skip punches in that case: reclaiming space during
+		teardown is not worth the risk.
 	*/
-	if err := d.writer.Enqueue(
-		diskWriteOp{
-			writes:  plans,
-			punches: coalescePunchPlans(punchPlans),
-		},
-	); err != nil {
-		_ = d.shm.ReleaseIfCurrent(
-			[]ShmExtent{staged},
-		)
-
+	if err := d.writer.Enqueue(op); err != nil {
 		log.Printf(
-			"queue physical write failed: %v",
-			err,
+			"writer enqueue failed off=%d len=%d: %v (persisting inline)",
+			start, len(data), err,
 		)
 
-		return 0, toErrno(err)
+		if _, werr := d.imgFile.WriteAt(data, int64(start)); werr != nil {
+			_ = d.shm.ReleaseIfCurrent([]ShmExtent{staged})
+			return 0, toErrno(werr)
+		}
+
+		_ = d.shm.ReleaseIfCurrent([]ShmExtent{staged})
+		return uint32(len(data)), 0
 	}
 
 	return uint32(len(data)), 0
