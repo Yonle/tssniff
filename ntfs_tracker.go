@@ -2202,12 +2202,10 @@ func (t *NTFSTracker) scanMFTLogicalRangeLocked(
 }
 
 func (t *NTFSTracker) mftRecordCount() uint64 {
-	if t.mftRecordSize == 0 ||
-		t.mftSize == 0 {
+	if t.mftRecordSize == 0 || t.mftSize == 0 {
 		return 0
 	}
-
-	return t.mftSize + t.mftRecordSize - 1
+	return (t.mftSize + t.mftRecordSize - 1) / t.mftRecordSize
 }
 
 /*
