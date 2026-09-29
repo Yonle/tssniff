@@ -72,7 +72,7 @@ func (g *USBGadget) Setup() error {
 	   likely to be lost. Removing FUA from the hot path shortens the
 	   window.
 	*/
-	g.writeFile(filepath.Join(lunDir, "nofua"), "1")
+	g.writeFile(filepath.Join(lunDir, "nofua"), "0")
 	g.writeFile(filepath.Join(lunDir, "cdrom"), "0")
 	g.writeFile(filepath.Join(lunDir, "ro"), "0")
 	g.writeFile(filepath.Join(lunDir, "removable"), "1")
