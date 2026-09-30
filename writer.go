@@ -20,7 +20,6 @@ type writerCommandKind uint8
 
 const (
 	writerWrite writerCommandKind = iota
-	writerPunch
 	writerBarrier
 )
 
@@ -28,7 +27,6 @@ type writerCommand struct {
 	kind writerCommandKind
 
 	write   WriteEvent
-	punch   PunchRequest
 	barrier chan error
 }
 
@@ -42,7 +40,23 @@ type Writer struct {
 	disk *os.File
 	shm  *SHMDisk
 
+	/*
+		Normal commands:
+		- writes
+		- barriers
+
+		These always have priority over punches.
+	*/
 	in chan writerCommand
+
+	/*
+		Punches are deliberately kept separate from normal writes.
+
+		A slow FALLOC_FL_PUNCH_HOLE therefore cannot fill the normal
+		writer queue or force us to interleave write/punch commands
+		inside one channel.
+	*/
+	punchIn chan PunchRequest
 
 	wg sync.WaitGroup
 
@@ -67,6 +81,11 @@ func NewWriter(
 			chan writerCommand,
 			writerQueueDepth,
 		),
+
+		punchIn: make(
+			chan PunchRequest,
+			writerQueueDepth,
+		),
 	}
 }
 
@@ -80,6 +99,10 @@ func (w *Writer) Input() chan<- writerCommand {
 	return w.in
 }
 
+func (w *Writer) PunchInput() chan<- PunchRequest {
+	return w.punchIn
+}
+
 func (w *Writer) SubmitWrite(
 	ev WriteEvent,
 ) {
@@ -91,10 +114,22 @@ func (w *Writer) SubmitWrite(
 
 func (w *Writer) SubmitPunch(
 	req PunchRequest,
-) {
-	w.in <- writerCommand{
-		kind:  writerPunch,
-		punch: req,
+) bool {
+	select {
+	case w.punchIn <- req:
+		return true
+
+	default:
+		if verbLog {
+			log.Printf(
+				"punch queue full, deferred captureSeq=%d phys=[%d,%d)",
+				req.CaptureSeq,
+				req.Start,
+				req.End,
+			)
+		}
+
+		return false
 	}
 }
 
@@ -107,6 +142,14 @@ func (w *Writer) SubmitBarrier(
 	}
 }
 
+func (w *Writer) CloseInput() {
+	close(w.in)
+}
+
+func (w *Writer) ClosePunchInput() {
+	close(w.punchIn)
+}
+
 func (w *Writer) Wait() {
 	w.wg.Wait()
 }
@@ -114,30 +157,116 @@ func (w *Writer) Wait() {
 func (w *Writer) run() {
 	defer w.wg.Done()
 
-	for cmd := range w.in {
-		switch cmd.kind {
-		case writerWrite:
-			w.processWrite(
-				cmd.write,
-			)
+	in := w.in
+	punchIn := w.punchIn
 
-		case writerPunch:
-			w.processPunch(
-				cmd.punch,
-			)
+	for {
+		/*
+			Drain normal commands whenever one is immediately
+			available.
 
-		case writerBarrier:
-			err := w.disk.Sync()
+			This gives writes/barriers priority over punches.
+		*/
+		for in != nil {
+			select {
+			case cmd, ok := <-in:
+				if !ok {
+					in = nil
+					continue
+				}
 
-			cmd.barrier <- err
-			close(cmd.barrier)
+				w.processCommand(cmd)
+
+			default:
+				/*
+					No normal command is immediately available.
+				*/
+				goto wait
+			}
 		}
+
+	wait:
+		/*
+			If both inputs are closed, we're done.
+		*/
+		if in == nil &&
+			punchIn == nil {
+			return
+		}
+
+		/*
+			Wait for either:
+			- another normal command
+			- a punch
+
+			Normal commands win whenever they are already queued because
+			the loop above drains them before entering this select.
+		*/
+		switch {
+		case in != nil && punchIn != nil:
+			select {
+			case cmd, ok := <-in:
+				if !ok {
+					in = nil
+					continue
+				}
+
+				w.processCommand(cmd)
+
+			case req, ok := <-punchIn:
+				if !ok {
+					punchIn = nil
+					continue
+				}
+
+				w.processPunch(req)
+			}
+
+		case in != nil:
+			cmd, ok := <-in
+			if !ok {
+				in = nil
+				continue
+			}
+
+			w.processCommand(cmd)
+
+		default:
+			req, ok := <-punchIn
+			if !ok {
+				punchIn = nil
+				continue
+			}
+
+			w.processPunch(req)
+		}
+	}
+}
+
+func (w *Writer) processCommand(
+	cmd writerCommand,
+) {
+	switch cmd.kind {
+	case writerWrite:
+		w.processWrite(
+			cmd.write,
+		)
+
+	case writerBarrier:
+		err := w.disk.Sync()
+
+		cmd.barrier <- err
+		close(cmd.barrier)
 	}
 }
 
 func (w *Writer) processWrite(
 	ev WriteEvent,
 ) {
+	end :=
+		ev.Offset +
+			uint64(len(ev.Data))
+
 	/*
 		Record the write before touching the disk.
 
@@ -147,8 +276,7 @@ func (w *Writer) processWrite(
 	w.rememberWrite(
 		ev.Seq,
 		ev.Offset,
-		ev.Offset+
-			uint64(len(ev.Data)),
+		end,
 	)
 
 	n, err := w.disk.WriteAt(
