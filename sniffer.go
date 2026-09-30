@@ -62,7 +62,7 @@ func (s *Sniffer) run() {
 	defer close(s.out)
 
 	for ev := range s.in {
-		chunks, _ := s.scanner.Feed(
+		chunks, isMPEGTS := s.scanner.Feed(
 			ev.Offset,
 			ev.Data,
 		)
@@ -70,11 +70,6 @@ func (s *Sniffer) run() {
 		var captures []CaptureRange
 
 		for _, chunk := range chunks {
-			/*
-				This chunk is already an owned copy from TSScanner.
-
-				Hub.Broadcast itself is non-blocking.
-			*/
 			s.hub.Broadcast(
 				chunk.Data,
 			)
@@ -99,13 +94,8 @@ func (s *Sniffer) run() {
 		}
 
 		s.out <- ObservedWrite{
-			Seq: ev.Seq,
-
-			Offset: ev.Offset,
-			End: ev.Offset +
-				uint64(len(ev.Data)),
-
-			TouchesMFT: ev.TouchesMFT,
+			Event:  ev,
+			MPEGTS: isMPEGTS,
 
 			Captures: captures,
 		}
