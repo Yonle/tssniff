@@ -172,6 +172,8 @@ The image is temporary and does not survive a reboot. Running out of tmpfs space
 
 `gadget.sh` is a small lifecycle wrapper around `tssniff`.
 
+It only handles:
+
 ```text
 prepare-fakedisk    Create the sparse NTFS image if missing
 start               Prepare the image and start tssniff
@@ -186,7 +188,9 @@ sudo ./gadget.sh start
 sudo ./gadget.sh stop
 ```
 
-The USB gadget itself is configured and owned by `tssniff`.
+The wrapper prepares the NTFS image, loads `libcomposite` and ConfigFS when starting, then launches `tssniff`.
+
+`tssniff` itself owns the USB gadget configuration and teardown.
 
 ## Testing without a USB gadget
 
