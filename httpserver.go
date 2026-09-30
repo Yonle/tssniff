@@ -6,42 +6,90 @@ import (
 	"net/http"
 )
 
-func startStreamServer(addr string, hub *Hub) {
-	listener, err := net.Listen("tcp", addr)
+func newStreamServer(
+	addr string,
+	hub *Hub,
+) (*http.Server, net.Listener, error) {
+	listener, err := net.Listen(
+		"tcp",
+		addr,
+	)
 	if err != nil {
-		log.Fatalf("TCP listener failed on %s: %v", addr, err)
+		return nil,
+			nil,
+			err
 	}
-	defer listener.Close()
-
-	log.Printf("TS Stream Server listening on %s", addr)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "video/mp2t")
-		w.Header().Set("Cache-Control", "no-cache")
 
-		flusher, _ := w.(http.Flusher)
+	mux.HandleFunc(
+		"/stream",
+		func(
+			w http.ResponseWriter,
+			r *http.Request,
+		) {
+			w.Header().Set(
+				"Content-Type",
+				"video/mp2t",
+			)
 
-		// Send headers now.  Without this, Go buffers them until the
-		// first body write, and a client that connects while no TS
-		// data is being broadcast sees a connection that hangs.
-		if flusher != nil {
-			flusher.Flush()
-		}
+			w.Header().Set(
+				"Cache-Control",
+				"no-cache",
+			)
 
-		client := hub.Register(r.Context())
-		defer hub.Unregister(client)
+			flusher, _ := w.(http.Flusher)
 
-		for data := range client.Ch() {
-			if _, err := w.Write(data); err != nil {
-				return
-			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-		}
-	})
 
-	srv := &http.Server{Handler: mux}
-	_ = srv.Serve(listener)
+			client := hub.Register(
+				r.Context(),
+			)
+
+			defer hub.Unregister(
+				client,
+			)
+
+			for data := range client.Ch() {
+
+				if _, err := w.Write(data); err != nil {
+					return
+				}
+
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		},
+	)
+
+	server := &http.Server{
+		Handler: mux,
+	}
+
+	return server,
+		listener,
+		nil
+}
+
+func serveStreamServer(
+	server *http.Server,
+	listener net.Listener,
+) {
+	log.Printf(
+		"TS Stream Server listening on %s",
+		listener.Addr(),
+	)
+
+	err := server.Serve(listener)
+
+	if err != nil &&
+		err != http.ErrServerClosed {
+		log.Printf(
+			"stream server stopped: %v",
+			err,
+		)
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"sort"
 	"sync"
@@ -13,9 +12,9 @@ import (
 
 var (
 	ErrSHMClosed        = errors.New("shm overlay closed")
-	ErrSHMStale         = errors.New("shm generation is stale")
 	ErrSHMInvalidRange  = errors.New("invalid shm range")
 	ErrSHMOutsideVolume = errors.New("shm range outside volume")
+	ErrSHMStale         = errors.New("shm generation is stale")
 )
 
 const (
@@ -41,13 +40,7 @@ type SHMDisk struct {
 	closed  bool
 
 	/*
-		Sorted, non-overlapping logical overlay extents.
-
-		The bytes themselves live in /dev/shm.
-		This slice contains only metadata:
-
-		    physical/logical range
-		    generation number
+		Sorted, non-overlapping overlay extents.
 	*/
 	extents []ShmExtent
 }
@@ -57,11 +50,15 @@ func NewSHMDisk(
 	size uint64,
 ) (*SHMDisk, error) {
 	if base == nil {
-		return nil, fmt.Errorf("nil SHM base reader")
+		return nil, fmt.Errorf(
+			"nil SHM base reader",
+		)
 	}
 
 	if size == 0 {
-		return nil, fmt.Errorf("zero SHM size")
+		return nil, fmt.Errorf(
+			"zero SHM size",
+		)
 	}
 
 	file, err := os.CreateTemp(
@@ -70,19 +67,19 @@ func NewSHMDisk(
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"create /dev/shm overlay: %w",
+			"create SHM overlay: %w",
 			err,
 		)
 	}
 
 	path := file.Name()
 
-	if err := file.Truncate(int64(size)); err != nil {
-		file.Close()
+	if err := file.Truncate(
+		int64(size),
+	); err != nil {
 
-		if path != "" {
-			_ = os.Remove(path)
-		}
+		_ = file.Close()
+		_ = os.Remove(path)
 
 		return nil, fmt.Errorf(
 			"resize SHM overlay: %w",
@@ -99,13 +96,10 @@ func NewSHMDisk(
 	}, nil
 }
 
-/*
-StageWrite writes a new logical version into the /dev/shm overlay.
+func (s *SHMDisk) Size() uint64 {
+	return s.size
+}
 
-The returned generation identifies exactly this version of the range.
-
-The physical sparse image is NOT touched.
-*/
 func (s *SHMDisk) StageWrite(
 	data []byte,
 	off uint64,
@@ -119,16 +113,20 @@ func (s *SHMDisk) StageWrite(
 
 	if off >= s.size ||
 		uint64(len(data)) > s.size-off {
-		return ShmExtent{}, ErrSHMOutsideVolume
+		return ShmExtent{},
+			ErrSHMOutsideVolume
 	}
 
-	end := off + uint64(len(data))
+	end :=
+		off +
+			uint64(len(data))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.closed {
-		return ShmExtent{}, ErrSHMClosed
+		return ShmExtent{},
+			ErrSHMClosed
 	}
 
 	n, err := s.file.WriteAt(
@@ -140,17 +138,17 @@ func (s *SHMDisk) StageWrite(
 	}
 
 	if n != len(data) {
-		return ShmExtent{}, io.ErrShortWrite
+		return ShmExtent{},
+			io.ErrShortWrite
 	}
-
-	gen := s.nextGen
-	s.nextGen++
 
 	extent := ShmExtent{
 		Start: off,
 		End:   end,
-		Gen:   gen,
+		Gen:   s.nextGen,
 	}
+
+	s.nextGen++
 
 	s.replaceRangeLocked(extent)
 
@@ -162,7 +160,8 @@ func (s *SHMDisk) ReadAt(
 	off int64,
 ) (int, error) {
 	if off < 0 {
-		return 0, ErrSHMInvalidRange
+		return 0,
+			ErrSHMInvalidRange
 	}
 
 	if len(dst) == 0 {
@@ -173,16 +172,12 @@ func (s *SHMDisk) ReadAt(
 
 	if start >= s.size ||
 		uint64(len(dst)) > s.size-start {
-		return 0, ErrSHMOutsideVolume
+		return 0,
+			ErrSHMOutsideVolume
 	}
 
 	/*
-		Read the physical base first.
-
-		The SHM overlay is then applied on top.
-
-		This preserves the sparse-overlay model:
-		unchanged areas do not consume RAM in /dev/shm.
+		Start from the physical image.
 	*/
 	n, baseErr := s.base.ReadAt(
 		dst,
@@ -198,98 +193,23 @@ func (s *SHMDisk) ReadAt(
 		return 0, baseErr
 	}
 
-	reqEnd := start + uint64(len(dst))
-
-	/*
-		Take a snapshot of the currently visible overlay ranges.
-
-		The actual SHM reads happen while holding RLock so a release/punch
-		cannot modify the overlay bytes halfway through the copy.
-	*/
-	s.mu.RLock()
-
-	if !s.closed {
-		for _, e := range s.extents {
-			if e.End <= start {
-				continue
-			}
-
-			if e.Start >= reqEnd {
-				break
-			}
-
-			a := maxU64(
-				start,
-				e.Start,
-			)
-
-			b := minU64(
-				reqEnd,
-				e.End,
-			)
-
-			if a >= b {
-				continue
-			}
-
-			src := a
-			dstOff := a - start
-
-			if _, err := s.file.ReadAt(
-				dst[int(dstOff):int(dstOff+(b-a))],
-				int64(src),
-			); err != nil {
-				s.mu.RUnlock()
-
-				return 0, err
-			}
-		}
-	}
-
-	s.mu.RUnlock()
-
-	/*
-		ReadAt may have returned EOF for the physical base while the SHM
-		overlay completely satisfied the request.
-
-		The logical disk is still considered fully readable.
-	*/
-	return len(dst), nil
-}
-
-/*
-Snapshot returns the overlay generations currently covering a range.
-
-This is used when constructing a physical operation so the writer knows
-which logical version the operation belongs to.
-*/
-func (s *SHMDisk) Snapshot(
-	start,
-	end uint64,
-) []ShmExtent {
-	if end <= start {
-		return nil
-	}
+	reqEnd :=
+		start +
+			uint64(len(dst))
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if s.closed {
-		return nil
+		return len(dst), nil
 	}
-
-	out := make(
-		[]ShmExtent,
-		0,
-		4,
-	)
 
 	for _, e := range s.extents {
 		if e.End <= start {
 			continue
 		}
 
-		if e.Start >= end {
+		if e.Start >= reqEnd {
 			break
 		}
 
@@ -299,7 +219,7 @@ func (s *SHMDisk) Snapshot(
 		)
 
 		b := minU64(
-			end,
+			reqEnd,
 			e.End,
 		)
 
@@ -307,258 +227,88 @@ func (s *SHMDisk) Snapshot(
 			continue
 		}
 
-		out = append(
-			out,
-			ShmExtent{
-				Start: a,
-				End:   b,
-				Gen:   e.Gen,
-			},
+		dstOff :=
+			a - start
+
+		nread,
+			err := s.file.ReadAt(
+			dst[int(dstOff):int(dstOff+(b-a))],
+			int64(a),
 		)
+
+		if err != nil &&
+			err != io.EOF {
+			return 0, err
+		}
+
+		if nread != int(b-a) {
+			return 0,
+				io.ErrUnexpectedEOF
+		}
 	}
 
-	return out
+	return len(dst), nil
 }
 
-/*
-CurrentMatching intersects planned generations with the currently live
-overlay generations.
-
-If another logical write replaced part of the range, the newer generation
-will not match and that part is omitted.
-
-This is what prevents an old physical writer operation from accidentally
-persisting a newer capture-only write.
-*/
-func (s *SHMDisk) CurrentMatching(
+func (s *SHMDisk) ReleaseIfCurrent(
 	planned []ShmExtent,
-) []ShmExtent {
+) error {
 	if len(planned) == 0 {
 		return nil
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
-		return nil
-	}
-
-	out := make(
-		[]ShmExtent,
-		0,
-		len(planned),
-	)
+	var firstErr error
 
 	for _, p := range planned {
 		if p.End <= p.Start {
 			continue
 		}
 
-		for _, e := range s.extents {
-			if e.End <= p.Start {
-				continue
-			}
+		s.mu.Lock()
 
-			if e.Start >= p.End {
-				break
-			}
+		if s.closed {
+			s.mu.Unlock()
 
-			if e.Gen != p.Gen {
-				continue
-			}
-
-			a := maxU64(
-				p.Start,
-				e.Start,
-			)
-
-			b := minU64(
-				p.End,
-				e.End,
-			)
-
-			if a >= b {
-				continue
-			}
-
-			out = append(
-				out,
-				ShmExtent{
-					Start: a,
-					End:   b,
-					Gen:   p.Gen,
-				},
-			)
-		}
-	}
-
-	return coalesceShmExtents(out)
-}
-
-/*
-ReadGeneration reads a range only if that exact generation still owns the
-entire requested range.
-
-The writer uses this after CurrentMatching().
-
-If another write replaced the range in the meantime, ErrSHMStale is returned
-and the newer writer operation gets to handle it.
-*/
-func (s *SHMDisk) ReadGeneration(
-	dst []byte,
-	extent ShmExtent,
-) error {
-	if len(dst) == 0 {
-		return nil
-	}
-
-	if uint64(len(dst)) != extent.End-extent.Start {
-		return ErrSHMInvalidRange
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.closed {
-		return ErrSHMClosed
-	}
-
-	if !s.coversGenerationLocked(extent) {
-		return ErrSHMStale
-	}
-
-	n, err := s.file.ReadAt(
-		dst,
-		int64(extent.Start),
-	)
-
-	if err != nil {
-		if err == io.EOF && n == len(dst) {
-			return nil
-		}
-		return err
-	}
-
-	if n != len(dst) {
-		return io.ErrUnexpectedEOF
-	}
-
-	return nil
-}
-
-func (s *SHMDisk) Close() error {
-	s.mu.Lock()
-
-	if s.closed {
-		s.mu.Unlock()
-
-		return nil
-	}
-
-	s.closed = true
-
-	file := s.file
-	path := s.path
-
-	s.file = nil
-	s.extents = nil
-
-	s.mu.Unlock()
-
-	var firstErr error
-
-	if file != nil {
-		if err := file.Close(); err != nil {
-			firstErr = err
-		}
-	}
-
-	if path != "" {
-		if err := os.Remove(path); err != nil &&
-			!errors.Is(err, os.ErrNotExist) {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = ErrSHMClosed
 			}
-		}
-	}
-
-	return firstErr
-}
-
-func (s *SHMDisk) replaceRangeLocked(
-	newExtent ShmExtent,
-) {
-	out := make(
-		[]ShmExtent,
-		0,
-		len(s.extents)+1,
-	)
-
-	inserted := false
-
-	for _, e := range s.extents {
-		if e.End <= newExtent.Start {
-			out = append(out, e)
-			continue
-		}
-
-		if e.Start >= newExtent.End {
-			if !inserted {
-				out = append(out, newExtent)
-				inserted = true
-			}
-
-			out = append(out, e)
 
 			continue
 		}
 
 		/*
-			Overlap.
+			The exact generation must still own this range.
 
-			Keep the old generation on either side of the new write.
+			If a newer write replaced it, leave the newer overlay
+			untouched.
 		*/
-		if e.Start < newExtent.Start {
-			out = append(
-				out,
-				ShmExtent{
-					Start: e.Start,
-					End:   newExtent.Start,
-					Gen:   e.Gen,
-				},
-			)
+		if !s.coversGenerationLocked(p) {
+			s.mu.Unlock()
+			continue
 		}
 
-		if !inserted {
-			out = append(
-				out,
-				newExtent,
-			)
-
-			inserted = true
-		}
-
-		if e.End > newExtent.End {
-			out = append(
-				out,
-				ShmExtent{
-					Start: newExtent.End,
-					End:   e.End,
-					Gen:   e.Gen,
-				},
-			)
-		}
-	}
-
-	if !inserted {
-		out = append(
-			out,
-			newExtent,
+		err := s.punchLocked(
+			p.Start,
+			p.End-p.Start,
 		)
+
+		if err == nil {
+			s.removeRangeGenerationLocked(
+				p.Start,
+				p.End,
+				p.Gen,
+			)
+		}
+
+		s.mu.Unlock()
+
+		if err != nil &&
+			firstErr == nil {
+			firstErr = err
+		}
 	}
 
-	s.extents = coalesceShmExtents(out)
+	return firstErr
 }
 
 func (s *SHMDisk) coversGenerationLocked(
@@ -589,51 +339,73 @@ func (s *SHMDisk) coversGenerationLocked(
 	return false
 }
 
-func (s *SHMDisk) matchGenerationLocked(
-	want ShmExtent,
-) []ShmExtent {
+func (s *SHMDisk) replaceRangeLocked(
+	newExtent ShmExtent,
+) {
 	out := make(
 		[]ShmExtent,
 		0,
-		2,
+		len(s.extents)+1,
 	)
 
+	inserted := false
+
 	for _, e := range s.extents {
-		if e.End <= want.Start {
+		if e.End <= newExtent.Start {
+			out = append(out, e)
+
 			continue
 		}
 
-		if e.Start >= want.End {
-			break
-		}
+		if e.Start >= newExtent.End {
+			if !inserted {
+				out = append(out, newExtent)
 
-		if e.Gen != want.Gen {
+				inserted = true
+			}
+
+			out = append(out, e)
+
 			continue
 		}
 
-		a := maxU64(
-			want.Start,
-			e.Start,
-		)
-
-		b := minU64(
-			want.End,
-			e.End,
-		)
-
-		if a < b {
+		/*
+			Overlap.
+		*/
+		if e.Start < newExtent.Start {
 			out = append(
 				out,
 				ShmExtent{
-					Start: a,
-					End:   b,
+					Start: e.Start,
+					End:   newExtent.Start,
+					Gen:   e.Gen,
+				},
+			)
+		}
+
+		if !inserted {
+			out = append(out, newExtent)
+
+			inserted = true
+		}
+
+		if e.End > newExtent.End {
+			out = append(
+				out,
+				ShmExtent{
+					Start: newExtent.End,
+					End:   e.End,
 					Gen:   e.Gen,
 				},
 			)
 		}
 	}
 
-	return out
+	if !inserted {
+		out = append(out, newExtent)
+	}
+
+	s.extents = coalesceSHM(out)
 }
 
 func (s *SHMDisk) removeRangeGenerationLocked(
@@ -641,10 +413,6 @@ func (s *SHMDisk) removeRangeGenerationLocked(
 	end,
 	gen uint64,
 ) {
-	if end <= start {
-		return
-	}
-
 	out := make(
 		[]ShmExtent,
 		0,
@@ -683,7 +451,7 @@ func (s *SHMDisk) removeRangeGenerationLocked(
 		}
 	}
 
-	s.extents = coalesceShmExtents(out)
+	s.extents = coalesceSHM(out)
 }
 
 func (s *SHMDisk) punchLocked(
@@ -694,117 +462,70 @@ func (s *SHMDisk) punchLocked(
 		return nil
 	}
 
-	err := syscall.Fallocate(
+	return syscall.Fallocate(
 		int(s.file.Fd()),
 		shmFallocPunchHole|shmFallocKeepSize,
 		int64(off),
 		int64(length),
 	)
-
-	if err != nil {
-		log.Printf(
-			"SHM punch hole failed off=%d len=%d: %v",
-			off,
-			length,
-			err,
-		)
-
-		return err
-	}
-
-	return nil
 }
 
-func (s *SHMDisk) ReleaseIfCurrent(
-	planned []ShmExtent,
-) error {
-	if len(planned) == 0 {
-		return nil
-	}
-
-	var toPunch []ShmExtent
-
+func (s *SHMDisk) Close() error {
 	s.mu.Lock()
 
 	if s.closed {
 		s.mu.Unlock()
-		return ErrSHMClosed
+		return nil
 	}
 
-	for _, p := range planned {
-		if p.End <= p.Start {
-			continue
-		}
+	s.closed = true
 
-		matches := s.matchGenerationLocked(p)
+	file := s.file
+	path := s.path
 
-		for _, m := range matches {
-			s.removeRangeGenerationLocked(m.Start, m.End, m.Gen)
-			toPunch = append(toPunch, m)
-		}
-	}
+	s.file = nil
+	s.extents = nil
 
 	s.mu.Unlock()
 
-	/*
-		Punch each range under a short write lock.
-
-		Verify no newer extent covers the range before punching:
-		StageWrite can overwrite the same tmpfs offsets, and a
-		blind Fallocate would zero the newer bytes.
-
-		Holding the lock across a single Fallocate bounds reader
-		latency to one tmpfs punch, not the whole batch.
-	*/
 	var firstErr error
 
-	for _, m := range toPunch {
-		s.mu.Lock()
-
-		if s.closed {
-			s.mu.Unlock()
-			break
-		}
-
-		if s.anyExtentOverlapsLocked(m.Start, m.End) {
-			s.mu.Unlock()
-			continue
-		}
-
-		err := s.punchLocked(m.Start, m.End-m.Start)
-
-		s.mu.Unlock()
-
-		if err != nil && firstErr == nil {
+	if file != nil {
+		if err := file.Close(); err != nil {
 			firstErr = err
+		}
+	}
+
+	if path != "" {
+		if err := os.Remove(path); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
 	return firstErr
 }
 
-func (s *SHMDisk) anyExtentOverlapsLocked(
-	start,
-	end uint64,
-) bool {
-	for _, e := range s.extents {
-		if e.End <= start {
-			continue
-		}
-		if e.Start >= end {
-			break
-		}
-		return true
-	}
-	return false
-}
-
-func coalesceShmExtents(
+func coalesceSHM(
 	in []ShmExtent,
 ) []ShmExtent {
 	if len(in) == 0 {
 		return nil
 	}
+
+	sort.Slice(
+		in,
+		func(i, j int) bool {
+			if in[i].Start != in[j].Start {
+				return in[i].Start < in[j].Start
+			}
+
+			return in[i].End < in[j].End
+		},
+	)
 
 	out := make(
 		[]ShmExtent,
@@ -822,35 +543,30 @@ func coalesceShmExtents(
 
 			if last.End == e.Start &&
 				last.Gen == e.Gen {
+
 				last.End = e.End
 				continue
 			}
 		}
 
-		out = append(
-			out,
-			e,
-		)
+		out = append(out, e)
 	}
 
 	return out
 }
 
-func sortShmExtents(
-	in []ShmExtent,
-) {
-	sort.Slice(
-		in,
-		func(i, j int) bool {
-			if in[i].Start != in[j].Start {
-				return in[i].Start < in[j].Start
-			}
+func maxU64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
 
-			if in[i].End != in[j].End {
-				return in[i].End < in[j].End
-			}
+	return b
+}
 
-			return in[i].Gen < in[j].Gen
-		},
-	)
+func minU64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+
+	return b
 }

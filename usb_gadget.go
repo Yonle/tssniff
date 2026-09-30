@@ -5,143 +5,372 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 const (
 	gadgetName = "tsdisk"
-	gadgetPath = "/sys/kernel/config/usb_gadget/" + gadgetName
-	udcPath    = "/sys/class/udc"
+
+	gadgetPath = "/sys/kernel/config/usb_gadget/" +
+		gadgetName
+
+	udcPath = "/sys/class/udc"
 )
 
-// USBGadget manages the USB mass-storage gadget via configfs.
 type USBGadget struct {
 	backingDev string
 }
 
-func NewUSBGadget(backingDev string) *USBGadget {
-	return &USBGadget{backingDev: backingDev}
+func NewUSBGadget(
+	backingDev string,
+) *USBGadget {
+	return &USBGadget{
+		backingDev: backingDev,
+	}
 }
 
-// Setup creates the gadget, configures mass_storage, and binds it to a UDC.
 func (g *USBGadget) Setup() error {
-	// Clean up any existing gadget.
 	g.Teardown()
 
-	// Create gadget directory.
-	if err := os.MkdirAll(gadgetPath, 0755); err != nil {
-		return fmt.Errorf("create gadget dir: %w", err)
+	if err := os.MkdirAll(
+		gadgetPath,
+		0o755,
+	); err != nil {
+		return fmt.Errorf(
+			"create gadget dir: %w",
+			err,
+		)
 	}
 
-	// Set USB IDs (generic mass storage).
-	g.writeFile(filepath.Join(gadgetPath, "idVendor"), "0x1d6b")
-	g.writeFile(filepath.Join(gadgetPath, "idProduct"), "0x0104")
-	g.writeFile(filepath.Join(gadgetPath, "bcdDevice"), "0x0100")
-	g.writeFile(filepath.Join(gadgetPath, "bcdUSB"), "0x0200")
+	g.writeFile(
+		filepath.Join(
+			gadgetPath,
+			"idVendor",
+		),
+		"0x1d6b",
+	)
 
-	// Strings.
-	os.MkdirAll(filepath.Join(gadgetPath, "strings/0x409"), 0755)
-	g.writeFile(filepath.Join(gadgetPath, "strings/0x409/serialnumber"), "9911010101")
-	g.writeFile(filepath.Join(gadgetPath, "strings/0x409/manufacturer"), "yonleLABORATORY")
-	g.writeFile(filepath.Join(gadgetPath, "strings/0x409/product"), "TSSniff")
+	g.writeFile(
+		filepath.Join(
+			gadgetPath,
+			"idProduct",
+		),
+		"0x0104",
+	)
 
-	// Config.
-	cfgDir := filepath.Join(gadgetPath, "configs/c.1")
-	os.MkdirAll(filepath.Join(cfgDir, "strings/0x409"), 0755)
-	g.writeFile(filepath.Join(cfgDir, "strings/0x409/configuration"), "Mass Storage")
-	g.writeFile(filepath.Join(cfgDir, "MaxPower"), "250")
+	g.writeFile(
+		filepath.Join(
+			gadgetPath,
+			"bcdDevice",
+		),
+		"0x0100",
+	)
 
-	// Function: mass_storage.
-	funcDir := filepath.Join(gadgetPath, "functions/mass_storage.0")
-	if err := os.MkdirAll(funcDir, 0755); err != nil {
-		return fmt.Errorf("create mass_storage function: %w", err)
+	g.writeFile(
+		filepath.Join(
+			gadgetPath,
+			"bcdUSB",
+		),
+		"0x0200",
+	)
+
+	stringsDir := filepath.Join(
+		gadgetPath,
+		"strings/0x409",
+	)
+
+	if err := os.MkdirAll(
+		stringsDir,
+		0o755,
+	); err != nil {
+		return fmt.Errorf(
+			"create gadget strings: %w",
+			err,
+		)
 	}
-	g.writeFile(filepath.Join(funcDir, "stall"), "0")
-	g.writeFile(filepath.Join(funcDir, "num_buffers"), "8")
 
-	// LUN 0: backing block device.
-	lunDir := filepath.Join(funcDir, "lun.0")
-	os.MkdirAll(lunDir, 0755)
+	g.writeFile(
+		filepath.Join(
+			stringsDir,
+			"serialnumber",
+		),
+		"9911010101",
+	)
+
+	g.writeFile(
+		filepath.Join(
+			stringsDir,
+			"manufacturer",
+		),
+		"yonleLABORATORY",
+	)
+
+	g.writeFile(
+		filepath.Join(
+			stringsDir,
+			"product",
+		),
+		"TSSniff",
+	)
+
+	cfgDir := filepath.Join(
+		gadgetPath,
+		"configs/c.1",
+	)
+
+	cfgStrings := filepath.Join(
+		cfgDir,
+		"strings/0x409",
+	)
+
+	if err := os.MkdirAll(
+		cfgStrings,
+		0o755,
+	); err != nil {
+		return fmt.Errorf(
+			"create config strings: %w",
+			err,
+		)
+	}
+
+	g.writeFile(
+		filepath.Join(
+			cfgStrings,
+			"configuration",
+		),
+		"Mass Storage",
+	)
+
+	g.writeFile(
+		filepath.Join(
+			cfgDir,
+			"MaxPower",
+		),
+		"250",
+	)
+
+	funcDir := filepath.Join(
+		gadgetPath,
+		"functions/mass_storage.0",
+	)
+
+	if err := os.MkdirAll(
+		funcDir,
+		0o755,
+	); err != nil {
+		return fmt.Errorf(
+			"create mass storage function: %w",
+			err,
+		)
+	}
+
+	g.writeFile(
+		filepath.Join(
+			funcDir,
+			"stall",
+		),
+		"0",
+	)
+
+	g.writeFile(
+		filepath.Join(
+			funcDir,
+			"num_buffers",
+		),
+		"8",
+	)
+
+	lunDir := filepath.Join(
+		funcDir,
+		"lun.0",
+	)
+
+	if err := os.MkdirAll(
+		lunDir,
+		0o755,
+	); err != nil {
+		return fmt.Errorf(
+			"create LUN: %w",
+			err,
+		)
+	}
+
 	/*
-	   nofua=1: do not force a synchronous FUA flush on every
-	   SCSI WRITE(10,12).
-
-	   The host's FUA handling parks the function driver inside
-	   f_mass_storage while the backing store completes. That is
-	   exactly the state in which the DWC3 completion event is most
-	   likely to be lost. Removing FUA from the hot path shortens the
-	   window.
+		Keep the current behavior from your working tree.
 	*/
-	g.writeFile(filepath.Join(lunDir, "nofua"), "0")
-	g.writeFile(filepath.Join(lunDir, "cdrom"), "0")
-	g.writeFile(filepath.Join(lunDir, "ro"), "0")
-	g.writeFile(filepath.Join(lunDir, "removable"), "1")
-	g.writeFile(filepath.Join(lunDir, "file"), g.backingDev)
+	g.writeFile(
+		filepath.Join(
+			lunDir,
+			"nofua",
+		),
+		"0",
+	)
 
-	g.writeFile(filepath.Join(lunDir, "inquiry_string"), "TSSniff Disk")
+	g.writeFile(
+		filepath.Join(
+			lunDir,
+			"cdrom",
+		),
+		"0",
+	)
 
-	// Link function to config.
-	linkPath := filepath.Join(cfgDir, "mass_storage.0")
-	os.Symlink(funcDir, linkPath)
+	g.writeFile(
+		filepath.Join(
+			lunDir,
+			"ro",
+		),
+		"0",
+	)
 
-	// Bind to UDC.
+	g.writeFile(
+		filepath.Join(
+			lunDir,
+			"removable",
+		),
+		"1",
+	)
+
+	g.writeFile(
+		filepath.Join(
+			lunDir,
+			"file",
+		),
+		g.backingDev,
+	)
+
+	g.writeFile(
+		filepath.Join(
+			lunDir,
+			"inquiry_string",
+		),
+		"TSSniff Disk",
+	)
+
+	linkPath := filepath.Join(
+		cfgDir,
+		"mass_storage.0",
+	)
+
+	if err := os.Symlink(
+		funcDir,
+		linkPath,
+	); err != nil {
+		return fmt.Errorf(
+			"link mass storage function: %w",
+			err,
+		)
+	}
+
 	udc, err := g.findUDC()
 	if err != nil {
-		return fmt.Errorf("find UDC: %w", err)
+		return fmt.Errorf(
+			"find UDC: %w",
+			err,
+		)
 	}
-	g.writeFile(filepath.Join(gadgetPath, "UDC"), udc)
 
-	log.Printf("USB gadget bound to %s with backing %s", udc, g.backingDev)
+	g.writeFile(
+		filepath.Join(
+			gadgetPath,
+			"UDC",
+		),
+		udc,
+	)
+
+	log.Printf(
+		"USB gadget bound to %s with backing %s",
+		udc,
+		g.backingDev,
+	)
+
 	return nil
 }
 
-// Teardown removes the gadget.
 func (g *USBGadget) Teardown() {
-	// Nothing to tear down if the gadget was never created.
 	if _, err := os.Stat(gadgetPath); os.IsNotExist(err) {
 		return
 	}
 
-	// Unbind UDC (only if the file exists).
-	udcFile := filepath.Join(gadgetPath, "UDC")
+	udcFile := filepath.Join(
+		gadgetPath,
+		"UDC",
+	)
+
 	if _, err := os.Stat(udcFile); err == nil {
-		g.writeFile(udcFile, "")
+		g.writeFile(
+			udcFile,
+			"",
+		)
 	}
 
-	os.Remove(filepath.Join(gadgetPath, "configs/c.1/mass_storage.0"))
-	os.RemoveAll(filepath.Join(gadgetPath, "functions/mass_storage.0"))
-	os.RemoveAll(filepath.Join(gadgetPath, "configs/c.1"))
-	os.RemoveAll(filepath.Join(gadgetPath, "strings/0x409"))
-	os.RemoveAll(gadgetPath)
+	_ = os.Remove(
+		filepath.Join(
+			gadgetPath,
+			"configs/c.1/mass_storage.0",
+		),
+	)
+
+	_ = os.RemoveAll(
+		filepath.Join(
+			gadgetPath,
+			"functions/mass_storage.0",
+		),
+	)
+
+	_ = os.RemoveAll(
+		filepath.Join(
+			gadgetPath,
+			"configs/c.1",
+		),
+	)
+
+	_ = os.RemoveAll(
+		filepath.Join(
+			gadgetPath,
+			"strings/0x409",
+		),
+	)
+
+	_ = os.RemoveAll(
+		gadgetPath,
+	)
 }
 
 func (g *USBGadget) findUDC() (string, error) {
-	entries, err := os.ReadDir(udcPath)
+	entries, err := os.ReadDir(
+		udcPath,
+	)
 	if err != nil {
 		return "", err
 	}
-	for _, e := range entries {
-		return e.Name(), nil
+
+	for _, entry := range entries {
+		return entry.Name(), nil
 	}
-	return "", fmt.Errorf("no UDC found")
+
+	return "",
+		fmt.Errorf(
+			"no UDC found",
+		)
 }
 
-func (g *USBGadget) writeFile(path, value string) {
-	if err := os.WriteFile(path, []byte(value), 0644); err != nil {
-		if os.IsNotExist(err) { // nonfatal
+func (g *USBGadget) writeFile(
+	path,
+	value string,
+) {
+	if err := os.WriteFile(
+		path,
+		[]byte(value),
+		0o644,
+	); err != nil {
+
+		if os.IsNotExist(err) {
 			return
 		}
-		log.Printf("Warning: write %s: %v", path, err)
-	}
-}
 
-// WaitForNBDDevice waits for the NBD device node to appear.
-func WaitForNBDDevice(devPath string) error {
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(devPath); err == nil {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
+		log.Printf(
+			"warning: write %s: %v",
+			path,
+			err,
+		)
 	}
-	return fmt.Errorf("timeout waiting for %s", devPath)
 }

@@ -1,8 +1,8 @@
 # tssniff
 
-`tssniff` is a Linux userspace utility that presents a **fake USB storage medium** to a connected host, captures the MPEG-TS data the host writes to it, and makes that data available as an HTTP stream.
+`tssniff` is a Linux userspace utility that presents a **fake USB storage medium** to a connected host, detects MPEG-TS data written to it, and exposes the captured data as an HTTP stream.
 
-The host sees an ordinary MBR-partitioned USB drive. Recording data is broadcast over HTTP instead of being written to the backing image.
+The host sees an ordinary MBR-partitioned NTFS USB drive. `tssniff` exposes the disk through FUSE, persists writes asynchronously, tracks NTFS file-data ranges, and punches captured recording data back to sparse holes.
 
 ## How it works
 
@@ -10,52 +10,55 @@ The host sees an ordinary MBR-partitioned USB drive. Recording data is broadcast
 Host / STB
     │  USB Mass Storage
     ▼
-USB gadget (configfs)
+USB gadget
     │  /mnt/tsdisk/disk.img
     ▼
 tssniff (FUSE)
     │
-    ├── filesystem tracker
-    │       ├── NTFS   (default)
-    │       └── FAT32  (supported)
+    ├── SHM write staging
     │
-    ├── TS detector
+    ├── Sniffer
+    │     └── MPEG-TS detector
+    │
+    ├── Writer
+    │     └── backing image
+    │
+    ├── NTFS tracker
+    │     └── MFT / file-data ranges
+    │
+    ├── Reconciler
+    │     └── punchout
     │
     └── HTTP /stream
-    │
-    ▼
-sparse backing image
 ```
 
-The gadget's LUN points at a file exposed by `tssniff` through FUSE. Every write the host issues lands in `DiskNode.Write`, where the offset is classified by the selected tracker.
+The USB gadget's Mass Storage LUN points to a file exposed by `tssniff` through FUSE.
 
-* **NTFS** — the tracker reads the MFT to find unnamed nonresident `$DATA` streams of ordinary user files. A data write that arrives before the MFT identifies its file extent is temporarily stored, replayed into the TS detector once the extent is known, and punched back to a hole.
-* **FAT32** — the tracker derives a metadata boundary from the boot sector. Writes outside that boundary are treated as recording candidates.
+Host writes are staged in shared memory and submitted to an asynchronous pipeline. The sniffer examines the writes for MPEG-TS data while the writer persists them to the backing image.
 
-The captured stream is available at `http://<host>:6969/stream`.
+The NTFS tracker reads the Master File Table (MFT) to determine which physical ranges belong to ordinary files. Captured MPEG-TS ranges are reconciled against those ranges and punched back to sparse holes after they are identified.
 
 ## Requirements
 
 Kernel:
 
-- FUSE (`/dev/fuse`)
-- `CONFIG_USB_CONFIGFS`
-- `CONFIG_USB_CONFIGFS_MASS_STORAGE`
-- `CONFIG_USB_LIBCOMPOSITE`
-- a UDC (`/sys/class/udc/`)
+* FUSE (`/dev/fuse`)
+* `CONFIG_USB_CONFIGFS`
+* `CONFIG_USB_CONFIGFS_MASS_STORAGE`
+* `CONFIG_USB_LIBCOMPOSITE`
+* a USB Device Controller (`/sys/class/udc/`)
 
 Userspace:
 
-- `fuse3`
-- `util-linux`
-- `dosfstools` (FAT32 only)
-- `ntfs-3g` or `mkntfs` (NTFS only)
-- Go ≥ 1.20
+* `fuse3`
+* `util-linux`
+* `ntfs-3g` / `mkntfs`
+* Go 1.20 or newer
 
-Debian family:
+Debian-family systems:
 
 ```sh
-sudo apt install fuse3 dosfstools ntfs-3g
+sudo apt install fuse3 util-linux ntfs-3g
 ```
 
 ## Build
@@ -76,152 +79,171 @@ sudo ./tssniff \
     -listen :6969
 ```
 
-NTFS is the default. To use FAT32:
+| Option       | Default           | Description               |
+| ------------ | ----------------- | ------------------------- |
+| `-image`     | `/srv/guoxin.img` | NTFS backing image        |
+| `-mount`     | `/mnt/tsdisk`     | FUSE mount point          |
+| `-listen`    | `:6969`           | HTTP listen address       |
+| `-no-gadget` | `false`           | Skip USB gadget setup     |
+| `-debug`     | `false`           | Enable FUSE debug logging |
+| `-verbose`   | `false`           | Enable verbose logging    |
+
+Stream clients:
 
 ```sh
-sudo ./tssniff -fs fat32 -image /srv/guoxin.img
-```
-
-| Option       | Default           | Description                                  |
-| ------------ | ----------------- | -------------------------------------------- |
-| `-fs`        | `ntfs`            | Filesystem tracker: `ntfs` or `fat32`        |
-| `-image`     | `/srv/guoxin.img` | Sparse backing image                         |
-| `-mount`     | `/mnt/tsdisk`     | FUSE mount point                             |
-| `-listen`    | `:6969`           | HTTP listen address                          |
-| `-preserve`  | `false`           | Retain recording data in the sparse image    |
-| `-no-gadget` | `false`           | Skip USB gadget setup                        |
-| `-debug`     | `false`           | FUSE debug logging                           |
-| `-verbose`   | `false`           | Verbose logging                              |
-
-Clients:
-
-```sh
-mpv http://localhost:6969/stream
+mpv http://127.0.0.1:6969/stream
 ffmpeg -i http://127.0.0.1:6969/stream -c copy out.ts
 ```
 
-## Filesystem handling
+## NTFS handling
 
-### NTFS
+`tssniff` uses the NTFS Master File Table to track physical file-data ownership.
 
-Metadata is distributed throughout the volume. `tssniff` reads and tracks the MFT to find unnamed nonresident `$DATA` streams. Each file gets a stream ID such as `ntfs:35`. Extents carry both a physical offset and a logical file offset, so a fragmented file is reconstructed in logical order.
+It tracks ordinary in-use files with unnamed, nonresident `$DATA` streams and converts their NTFS runlists into physical byte ranges.
 
-An extent can be written before the MFT entry that identifies it. Such writes are temporarily stored, then replayed into the TS detector when the MFT update arrives, then punched back to a hole (unless `-preserve`).
+A recording file can be physically fragmented. Its data therefore does not have to occupy one contiguous region of the backing image.
 
-Backward writes in a file's logical address space are treated as a new segment, not as corruption.
+MFT updates may arrive separately from file-data writes. Captured TS ranges are kept in a fixed journal so they can be matched later when the corresponding NTFS data range becomes known.
 
-### FAT32
+The tracker only handles physical ownership. MPEG-TS detection is performed independently by the sniffer.
 
-A metadata boundary is derived from the boot sector, covering reserved sectors, both FAT copies, and the root directory. Writes past the boundary are recording candidates.
+## MPEG-TS extraction
 
-FAT32 recorders may reuse earlier physical regions (timeshift, ring buffer). Backward writes are probed independently for a new TS segment.
+The sniffer operates directly on host writes.
 
-FAT32 does not distinguish directory clusters from file data clusters at the block layer. The tracker classifies by offset only. It is functional but not the focus of this project.
+A write is checked for MPEG-TS packet structure, including:
 
-## `-preserve`
+* 188-byte packet alignment
+* `0x47` sync bytes
+* basic MPEG-TS header validation
+* consecutive valid packets
 
-The sparse image is the fake storage medium, not automatically an archive.
+Once MPEG-TS is detected, complete packets are emitted to `/stream`.
 
-With `-preserve=false` (default), recording data is broadcast over HTTP and not retained.
+Physical fragmentation is handled by treating non-contiguous writes as separate candidates rather than blindly concatenating unrelated filesystem writes.
 
-With `-preserve=true`, recording extents remain materialized in the image at their real offsets.
-
-On NTFS, newly written extents are transiently materialized until the MFT reveals them, then punched back when `-preserve=false`.
+The FUSE `Write()` path only stages the incoming data and submits it to the asynchronous pipeline. MPEG-TS detection, HTTP delivery, NTFS parsing, and punchout do not run directly in the FUSE write handler.
 
 ## Disk layout
 
-MBR-partitioned, one filesystem partition:
+The fake disk uses an MBR partition table with one NTFS partition.
 
 ```text
 +---------------------------+
-| MBR                       |  sector 0
+| MBR                       | sector 0
 +---------------------------+
-| alignment                 |  typically LBA 2048
+| alignment                 | typically LBA 2048
 +---------------------------+
-| Partition 1 (NTFS/FAT32)  |
+| Partition 1 (NTFS)        |
 +---------------------------+
 ```
 
-The image is sparse. `ls -l` reports logical size; `du` reports allocated size. They are not expected to match.
+The backing image is sparse.
 
-## tmpfs
+```sh
+ls -lh /srv/guoxin.img
+du -h /srv/guoxin.img
+```
 
-For lowest metadata latency, point `-image` at `/dev/shm`:
+`ls` reports the logical file size. `du` reports allocated storage.
+
+The image can therefore have a logical size of 1 TB while using much less physical storage.
+
+## Backing image on tmpfs
+
+For low-latency temporary storage, the backing image can be placed on `/dev/shm`:
 
 ```sh
 cp --sparse=always /srv/guoxin.img /dev/shm/guoxin.img
-sudo ./tssniff -image /dev/shm/guoxin.img
+
+sudo ./tssniff \
+    -image /dev/shm/guoxin.img
 ```
 
-Check `df -h /dev/shm` first. Running out of tmpfs pages delivers `SIGBUS`, not `ENOSPC`. The image does not survive reboot.
+Check available space first:
+
+```sh
+df -h /dev/shm
+```
+
+The image is temporary and does not survive a reboot. Running out of tmpfs space can result in `SIGBUS`.
 
 ## `gadget.sh`
 
+`gadget.sh` is a small lifecycle wrapper around `tssniff`.
+
 ```text
-prepare-fakedisk    Create the sparse backing image if missing
-prepare-tssniff     Start tssniff, wait for the FUSE file
-stop-tssniff        Stop the tssniff instance from this script
-mount / unmount     TEST ONLY: local mount of the FUSE file
-prepare-gadget      Create the configfs gadget (does not bind UDC)
-find-udc            Print available UDCs
-start / stop        Full lifecycle
-status              Current state
+prepare-fakedisk    Create the sparse NTFS image if missing
+start               Prepare the image and start tssniff
+stop                Stop tssniff
 ```
 
+Examples:
+
 ```sh
+sudo ./gadget.sh prepare-fakedisk
 sudo ./gadget.sh start
-sudo ./gadget.sh status
 sudo ./gadget.sh stop
 ```
 
+The USB gadget itself is configured and owned by `tssniff`.
+
 ## Testing without a USB gadget
+
+Run:
 
 ```sh
 sudo ./tssniff -verbose -no-gadget
 ```
 
-Mount the FUSE file locally with the matching filesystem. For FAT32:
+The FUSE-exposed disk can then be mounted locally:
 
 ```sh
-sudo mount -o loop,offset=1048576,sync /mnt/tsdisk/disk.img /mnt/guoxin
+sudo mount \
+    -t ntfs \
+    -o loop,offset=1048576,sync \
+    /mnt/tsdisk/disk.img \
+    /mnt/guoxin
 ```
 
-Do not create a loop device over `/mnt/tsdisk/disk.img` while the gadget is active. The loop driver and the gadget cannot both own the file safely.
+Do not create a separate loop device over `/mnt/tsdisk/disk.img` while the USB gadget is active.
 
 ## USB gadget
 
-Single Mass Storage function, LUN 0 points at `/mnt/tsdisk/disk.img`. The host performs its own MBR and filesystem parsing; `tssniff` does not mount that filesystem itself.
+`tssniff` creates a single USB Mass Storage function with LUN 0 pointing at:
+
+```text
+/mnt/tsdisk/disk.img
+```
+
+The host performs its own MBR and NTFS parsing. `tssniff` does not mount the NTFS filesystem itself.
 
 ## HTTP server
 
-`GET /stream` returns a chunked `video/mp2t` stream. Headers flush immediately on connect. Clients that connect before recording starts see a live connection waiting for data.
+```text
+GET /stream
+```
 
-The hub runs on its own goroutine. `Broadcast` never blocks the FUSE write path. A slow client only fills its own queue.
+returns a chunked `video/mp2t` stream.
 
-## TS extraction
+Clients may connect before recording starts and remain connected while waiting for MPEG-TS data.
 
-A write is not automatically TS. The detector works on logical file-stream order.
+The HTTP hub uses buffered queues, so a slow client does not block the FUSE write path.
 
-* A write exactly at the frontier continues the stream.
-* A write ahead of the frontier resets the sequential buffer.
-* A write below the frontier is treated as a backward segment and probed independently for a new TS segment.
+## Punchout
 
-NTFS uses logical file offsets. FAT32 uses physical offsets.
+`tssniff` punches identified recording-data ranges back to sparse holes using `FALLOC_FL_PUNCH_HOLE`.
 
-Once a logical stream is identified as MPEG-TS, unrelated candidates are not spliced into the active broadcast. A new recording can replace the active stream. Root directory writes can reset the detector.
+The backing filesystem must support sparse-file hole punching. Common Linux filesystems that support it include ext4, XFS, and Btrfs.
 
-Accepted bytes are buffered until complete 188-byte packets are available. Detection requires consecutive packets with sync byte `0x47` and header sanity. Partial packets are kept for the next write.
+The NTFS filesystem inside the fake disk is unrelated to the filesystem containing the backing image.
+
+Punchout works from the physical ranges discovered through the NTFS MFT. This allows recording data to be captured and then released from the backing image while leaving the logical disk size unchanged.
 
 ## Status
 
-Experimental. Treat the fake disk as a capture mechanism, not general-purpose storage. The host may report the volume as "not properly unmounted" after a session because `tssniff` does not emulate every shutdown-time filesystem transaction.
+Experimental.
 
-The extraction rules assume a single recording file is being written at a time.
+`tssniff` is designed around recording workloads that write MPEG-TS data to an NTFS-formatted USB storage device. It is not intended to emulate every aspect of a general-purpose USB disk or every NTFS filesystem transaction.
 
-### Punchout
-
-When a range is identified as recording data and not preserved, `tssniff` punches it back to a sparse hole in the backing image via `FALLOC_FL_PUNCH_HOLE`. This is why the image stays small for a long recording.
-
-Punchout requires the backing image's host filesystem to support sparse files. **ext4, XFS, and Btrfs support it. FAT32 and exFAT do not.** If you place the backing image on a filesystem without hole-punch support, the punch silently becomes a no-op or an error, and the image grows with the recording.
-
-For NTFS, punchout is applied to extents that the MFT has classified as recording data. For FAT32, the classification is offset-based and punchout is not applied — the image grows 4–8 MB per session as metadata is persisted.
+The extraction logic currently assumes that the recording workload can be identified from the host writes and NTFS metadata observed by `tssniff`.
