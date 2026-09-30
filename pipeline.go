@@ -191,6 +191,7 @@ func (p *WritePipeline) Wait() {
 
 func (p *WritePipeline) run() {
 	defer p.wg.Done()
+	defer close(p.observed)
 
 	pending := make(
 		map[uint64]WriteEvent,
