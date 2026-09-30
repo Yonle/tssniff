@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"log"
+	"sync"
+)
 
 const captureHistoryCapacity = 65536
 
@@ -99,39 +102,18 @@ func (r *Reconciler) run() {
 
 	for ev := range r.in {
 		/*
-			Every MPEG-TS capture is remembered first.
+			Remember every MPEG-TS capture.
 
-			This is what allows a future MFT update to say:
-			    "that video you saw 800 ms ago belongs to a file."
+			If NTFS already knows this physical range, it can be
+			punched immediately.
+
+			Otherwise it remains in the journal until an MFT update
+			reveals the corresponding file-data range.
 		*/
 		for _, capture := range ev.Captures {
 			r.captures.Add(capture)
 
-			/*
-				If NTFS already knows the area is user file data,
-				punch can be scheduled immediately.
-			*/
-			for _, dataRange := range rangeOverlaps(
-				capture.Start,
-				capture.End,
-				r.ntfs.DataRanges(),
-			) {
-				r.pipeline.SubmitPunch(
-					PunchRequest{
-						CaptureSeq: capture.Seq,
-
-						Start: maxU64(
-							capture.Start,
-							dataRange.Start,
-						),
-
-						End: minU64(
-							capture.End,
-							dataRange.End,
-						),
-					},
-				)
-			}
+			r.reconcileCapture(capture)
 		}
 
 		if !ev.TouchesMFT {
@@ -139,21 +121,20 @@ func (r *Reconciler) run() {
 		}
 
 		/*
-			The MFT write has now been fully observed by the sniffer.
+			Every MFT write is a reconciliation point.
 
-			NTFS reads through SHM, so even if the writer has not yet
-			persisted the metadata, NTFS sees the acknowledged bytes.
+			ObserveMFTWrite() refreshes the NTFS state using the
+			acknowledged SHM contents.
+
+			It returns only physical data ranges which were not
+			already known. Those are the only ranges which need
+			to be matched against historical captures.
 		*/
 		newRanges := r.ntfs.ObserveMFTWrite(
 			ev.Offset,
 			ev.End,
 		)
 
-		/*
-			These physical data ranges were not known previously.
-
-			Intersect them with the historical MPEG-TS captures.
-		*/
 		for _, dataRange := range newRanges {
 			r.captures.ForOverlap(
 				dataRange.Start,
@@ -173,12 +154,10 @@ func (r *Reconciler) run() {
 						return
 					}
 
-					r.pipeline.SubmitPunch(
-						PunchRequest{
-							CaptureSeq: c.Seq,
-							Start:      start,
-							End:        end,
-						},
+					r.submitPunch(
+						c.Seq,
+						start,
+						end,
 					)
 				},
 			)
@@ -186,38 +165,60 @@ func (r *Reconciler) run() {
 	}
 }
 
-func rangeOverlaps(
-	start,
-	end uint64,
-	ranges []ByteRange,
-) []ByteRange {
-	if end <= start ||
-		len(ranges) == 0 {
-		return nil
-	}
-
-	var out []ByteRange
-
-	for _, r := range ranges {
-		if r.End <= start ||
-			r.Start >= end {
+func (r *Reconciler) reconcileCapture(
+	capture CaptureRange,
+) {
+	for _, dataRange := range r.ntfs.DataRanges() {
+		if dataRange.End <= capture.Start ||
+			dataRange.Start >= capture.End {
 			continue
 		}
 
-		out = append(
-			out,
-			ByteRange{
-				Start: maxU64(
-					start,
-					r.Start,
-				),
-				End: minU64(
-					end,
-					r.End,
-				),
-			},
+		start := maxU64(
+			capture.Start,
+			dataRange.Start,
+		)
+
+		end := minU64(
+			capture.End,
+			dataRange.End,
+		)
+
+		if start >= end {
+			continue
+		}
+
+		r.submitPunch(
+			capture.Seq,
+			start,
+			end,
 		)
 	}
+}
 
-	return out
+func (r *Reconciler) submitPunch(
+	seq,
+	start,
+	end uint64,
+) {
+	if start >= end {
+		return
+	}
+
+	ok := r.pipeline.SubmitPunch(
+		PunchRequest{
+			CaptureSeq: seq,
+			Start:      start,
+			End:        end,
+		},
+	)
+
+	if !ok && verbLog {
+		log.Printf(
+			"punch deferred captureSeq=%d phys=[%d,%d)",
+			seq,
+			start,
+			end,
+		)
+	}
 }

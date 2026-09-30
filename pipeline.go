@@ -65,9 +65,16 @@ func NewWritePipeline(
 }
 
 func (p *WritePipeline) Start() {
-	p.wg.Add(1)
+	/*
+		One goroutine owns normal write/barrier dispatch.
+
+		Another goroutine forwards punches separately so a blocked
+		punch can never block normal write dispatch.
+	*/
+	p.wg.Add(2)
 
 	go p.run()
+	go p.runPunches()
 }
 
 func (p *WritePipeline) SubmitWrite(
@@ -107,14 +114,30 @@ func (p *WritePipeline) SubmitWrite(
 
 func (p *WritePipeline) SubmitPunch(
 	req PunchRequest,
-) {
+) bool {
 	/*
-		This is called by the reconciler, not FUSE Write().
+		Punches must never block the reconciler.
 
-		Blocking here is acceptable: the reconciler is deliberately
-		lower priority than the FUSE hot path.
+		If the bounded queue is full, leave the capture in the
+		reconciler's journal and let a later reconciliation attempt
+		submit it again.
 	*/
-	p.punches <- req
+	select {
+	case p.punches <- req:
+		return true
+
+	default:
+		if verbLog {
+			log.Printf(
+				"punch queue full, deferred captureSeq=%d phys=[%d,%d)",
+				req.CaptureSeq,
+				req.Start,
+				req.End,
+			)
+		}
+
+		return false
+	}
 }
 
 func (p *WritePipeline) Sync(
@@ -166,8 +189,6 @@ func (p *WritePipeline) run() {
 	var dispatchedSeq uint64
 
 	writesOpen := true
-	punchesOpen := true
-
 	snifferClosed := false
 
 	/*
@@ -248,9 +269,7 @@ func (p *WritePipeline) run() {
 		)
 	}
 
-	for writesOpen ||
-		punchesOpen {
-
+	for writesOpen {
 		select {
 		case ev, ok := <-p.writes:
 
@@ -273,27 +292,11 @@ func (p *WritePipeline) run() {
 		case req := <-p.barriers:
 
 			handleBarrier(req)
-
-		case req, ok := <-p.punches:
-
-			if !ok {
-				punchesOpen = false
-				continue
-			}
-
-			/*
-				The punch is sent after all writes that the sniffer
-				had already observed when it generated the request.
-
-				Newer writes which were already processed are checked
-				by Writer.hasNewerOverlap().
-			*/
-			p.writer.SubmitPunch(req)
 		}
 	}
 
 	/*
-		All punch requests have been consumed.
+		All normal writes have been dispatched.
 
 		If writes remained in the reorder map, something violated the
 		FUSE submission sequence. Don't silently pretend everything
@@ -313,10 +316,29 @@ func (p *WritePipeline) run() {
 	}
 
 	/*
-		Only after the entire pipeline has drained do we close the
-		writer input.
+		Normal writer commands are now finished.
+
+		The punch-forwarder owns the writer's punch input separately.
 	*/
-	close(
-		p.writer.Input(),
-	)
+	p.writer.CloseInput()
+}
+
+func (p *WritePipeline) runPunches() {
+	defer p.wg.Done()
+
+	/*
+		This goroutine is deliberately allowed to block on
+		writer.SubmitPunch().
+
+		It is isolated from the normal write pipeline, so a slow
+		eMMC punch cannot block WriteEvent dispatch.
+	*/
+	for req := range p.punches {
+		p.writer.SubmitPunch(req)
+	}
+
+	/*
+		No more punches can be generated after this point.
+	*/
+	p.writer.ClosePunchInput()
 }
