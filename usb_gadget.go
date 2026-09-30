@@ -171,14 +171,6 @@ func (g *USBGadget) Setup() error {
 		"0",
 	)
 
-	g.writeFile(
-		filepath.Join(
-			funcDir,
-			"num_buffers",
-		),
-		"8",
-	)
-
 	lunDir := filepath.Join(
 		funcDir,
 		"lun.0",
