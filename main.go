@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 var verbLog bool
@@ -18,7 +23,7 @@ func main() {
 		"FUSE mount point",
 	)
 
-	image := flag.String(
+	imagePath := flag.String(
 		"image",
 		"/srv/guoxin.img",
 		"sparse backing image",
@@ -27,25 +32,13 @@ func main() {
 	listenAddr := flag.String(
 		"listen",
 		":6969",
-		"HTTP stream listener",
-	)
-
-	filesystem := flag.String(
-		"fs",
-		"ntfs",
-		"filesystem type (supported: ntfs, fat32)",
+		"HTTP TS stream listener",
 	)
 
 	debug := flag.Bool(
 		"debug",
 		false,
 		"FUSE debug",
-	)
-
-	preserve := flag.Bool(
-		"preserve",
-		false,
-		"preserve TS to sparse disk",
 	)
 
 	noGadget := flag.Bool(
@@ -64,17 +57,18 @@ func main() {
 	flag.Parse()
 
 	imgFile, err := os.OpenFile(
-		*image,
+		*imagePath,
 		os.O_RDWR,
-		0666,
+		0o666,
 	)
 	if err != nil {
 		log.Fatalf(
 			"open sparse image %s: %v",
-			*image,
+			*imagePath,
 			err,
 		)
 	}
+
 	defer imgFile.Close()
 
 	st, err := imgFile.Stat()
@@ -88,7 +82,7 @@ func main() {
 	if !st.Mode().IsRegular() {
 		log.Fatalf(
 			"%s is not a regular file",
-			*image,
+			*imagePath,
 		)
 	}
 
@@ -96,26 +90,28 @@ func main() {
 
 	part, err := findMBRPartition(
 		imgFile,
-		*filesystem,
 	)
 	if err != nil {
-		log.Printf(
-			"Warning: MBR partition check: %v (raw device mode)",
+		log.Fatalf(
+			"find NTFS partition: %v",
 			err,
 		)
-	} else if verbLog {
+	}
+
+	if verbLog {
 		log.Printf(
-			"Found %s partition at offset %d, size %d",
-			*filesystem,
+			"NTFS partition offset=%d size=%d",
 			part.Offset,
 			part.Size,
 		)
 	}
 
 	/*
-		SHM is now the authoritative volatile disk overlay.
+		SHM is the authoritative acknowledged-write layer.
 
-		It lives in /dev/shm rather than in a Go []byte cache.
+		NTFS also reads through this object, so MFT parsing sees bytes
+		which FUSE has already acknowledged even if the physical writer
+		has not reached them yet.
 	*/
 	shm, err := NewSHMDisk(
 		imgFile,
@@ -123,77 +119,57 @@ func main() {
 	)
 	if err != nil {
 		log.Fatalf(
-			"initialize SHM overlay: %v",
+			"initialize SHM: %v",
 			err,
 		)
 	}
 
-	if verbLog {
-		log.Printf(
-			"SHM overlay: %s",
-			shm.path,
-		)
-	}
-
 	/*
-		The tracker MUST read through SHM.
+		NTFS has no worker goroutine of its own.
 
-		That means NTFS sees acknowledged-but-not-yet-persisted
-		writes exactly like FUSE Read() does.
+		The Reconciler owns all mutable NTFS state and is the only
+		goroutine which calls ObserveMFTWrite().
 	*/
-	var tracker Tracker
-
-	switch *filesystem {
-	case "ntfs":
-		tracker, err = NewNTFSTracker(
-			part,
-			shm,
-		)
-		if err != nil {
-			_ = shm.Close()
-
-			log.Fatalf(
-				"initialize NTFS tracker: %v",
-				err,
-			)
-		}
-
-	case "fat32", "vfat", "exfat":
-		tracker = NewFSTracker(
-			*filesystem,
-			part,
-			shm,
-		)
-
-	default:
+	ntfs, err := NewNTFS(
+		part,
+		shm,
+	)
+	if err != nil {
 		_ = shm.Close()
 
 		log.Fatalf(
-			"unsupported filesystem %q",
-			*filesystem,
+			"initialize NTFS tracker: %v",
+			err,
 		)
 	}
 
-	if verbLog {
-		log.Printf(
-			"tracker: metaEnd=%d",
-			tracker.MetadataEnd(),
-		)
-	}
+	hub := NewHub()
 
-	/*
-		The writer owns ALL slow access to the real sparse image.
-	*/
-	writer := NewDiskWriter(
+	writer := NewWriter(
 		imgFile,
 		shm,
 	)
 
+	sniffer := NewSniffer(
+		hub,
+	)
+
+	pipeline := NewWritePipeline(
+		writer,
+		sniffer,
+	)
+
+	reconciler := NewReconciler(
+		sniffer.Output(),
+		ntfs,
+		pipeline,
+	)
+
 	if err := os.MkdirAll(
 		*mountPoint,
-		0755,
+		0o755,
 	); err != nil {
-		_ = writer.Close()
+
 		_ = shm.Close()
 
 		log.Fatalf(
@@ -203,27 +179,16 @@ func main() {
 		)
 	}
 
-	hub := NewHub()
-
-	go startStreamServer(
-		*listenAddr,
-		hub,
-	)
-
-	server, err := mountDiskFS(
-		DiskFSOpts{
-			MountPoint: *mountPoint,
-			Image:      imgFile,
-			SHM:        shm,
-			Writer:     writer,
-			Hub:        hub,
-			Tracker:    tracker,
-			Preserve:   *preserve,
-			Debug:      *debug,
-		},
+	server, _, err := mountDiskFS(
+		*mountPoint,
+		imgFile,
+		shm,
+		writer,
+		pipeline,
+		ntfs,
+		*debug,
 	)
 	if err != nil {
-		_ = writer.Close()
 		_ = shm.Close()
 
 		log.Fatalf(
@@ -242,8 +207,52 @@ func main() {
 		diskPath,
 	)
 
+	/*
+		Start the workers only after FUSE mounted successfully.
+	*/
+	writer.Start()
+	sniffer.Start()
+	reconciler.Start()
+	pipeline.Start()
+
+	httpServer,
+		httpListener,
+		err := newStreamServer(
+		*listenAddr,
+		hub,
+	)
+	if err != nil {
+		if unmountErr := server.Unmount(); unmountErr != nil {
+			log.Printf(
+				"FUSE unmount: %v",
+				unmountErr,
+			)
+		}
+
+		pipeline.CloseWrites()
+
+		sniffer.Wait()
+		reconciler.Wait()
+
+		pipeline.ClosePunches()
+		pipeline.Wait()
+		writer.Wait()
+
+		_ = shm.Close()
+
+		log.Fatalf(
+			"start HTTP server: %v",
+			err,
+		)
+	}
+
+	go serveStreamServer(
+		httpServer,
+		httpListener,
+	)
+
 	log.Printf(
-		"Stream:    http://localhost%s/stream",
+		"Stream: http://localhost%s/stream",
 		*listenAddr,
 	)
 
@@ -255,9 +264,18 @@ func main() {
 		)
 
 		if err := gadget.Setup(); err != nil {
-			server.Unmount()
-			_ = writer.Close()
-			_ = shm.Close()
+
+			shutdown(
+				server,
+				gadget,
+				pipeline,
+				sniffer,
+				reconciler,
+				writer,
+				httpServer,
+				hub,
+				shm,
+			)
 
 			log.Fatalf(
 				"USB gadget setup: %v",
@@ -266,60 +284,146 @@ func main() {
 		}
 
 		log.Printf(
-			"USB gadget active, backing: %s",
+			"USB gadget active, backing %s",
 			diskPath,
 		)
 	} else {
 		log.Printf(
-			"USB gadget skipped (-no-gadget)",
+			"USB gadget skipped",
 		)
 	}
 
-	c := make(chan os.Signal, 1)
+	signalCh := make(chan os.Signal, 1)
 
 	signal.Notify(
-		c,
+		signalCh,
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
 
-	<-c
+	<-signalCh
 
 	log.Println(
 		"Shutting down...",
 	)
 
+	shutdown(
+		server,
+		gadget,
+		pipeline,
+		sniffer,
+		reconciler,
+		writer,
+		httpServer,
+		hub,
+		shm,
+	)
+}
+
+func shutdown(
+	server *fuse.Server,
+	gadget *USBGadget,
+	pipeline *WritePipeline,
+	sniffer *Sniffer,
+	reconciler *Reconciler,
+	writer *Writer,
+	httpServer *http.Server,
+	hub *Hub,
+	shm *SHMDisk,
+) {
 	/*
-		Stop the USB consumer first.
+		1. Stop the USB consumer.
 	*/
 	if gadget != nil {
 		gadget.Teardown()
 	}
 
 	/*
-		Stop accepting new FUSE requests.
-	*/
-	server.Unmount()
+		2. Stop accepting new FUSE requests.
 
-	/*
-		Now drain every already-accepted physical operation.
-
-		This is the ONLY place where shutdown waits for the real disk.
+		Unmount first. After it returns, Write() cannot begin another
+		request, which makes it safe for CloseWrites() to wait for the
+		rare fallback senders.
 	*/
-	if err := writer.Close(); err != nil {
+	if err := server.Unmount(); err != nil {
 		log.Printf(
-			"physical writer shutdown: %v",
+			"FUSE unmount: %v",
 			err,
 		)
 	}
 
 	/*
-		Only after the writer is completely gone do we remove /dev/shm.
+		3. Close the FUSE write input after all already-accepted
+		   fallback sends have reached the pipeline.
+	*/
+	pipeline.CloseWrites()
+
+	/*
+		4. Wait until the sniffer has observed every accepted write.
+	*/
+	sniffer.Wait()
+
+	/*
+		5. The reconciler now has the complete observation stream.
+
+		Waiting here ensures every MFT-triggered punch has been
+		submitted before the punch source is closed.
+	*/
+	reconciler.Wait()
+
+	/*
+		6. No more punch requests can be generated.
+	*/
+	pipeline.ClosePunches()
+
+	/*
+		7. Let the dispatcher finish and close the writer input.
+	*/
+	pipeline.Wait()
+
+	/*
+		8. Drain the physical writer.
+	*/
+	writer.Wait()
+
+	/*
+		9. Final backing-file flush.
+	*/
+	_ = osSyncBacking(writer)
+
+	/*
+		10. Stop HTTP after no more TS will be generated.
+	*/
+	ctx,
+		cancel := context.WithTimeout(
+		context.Background(),
+		2*time.Second,
+	)
+
+	_ = httpServer.Shutdown(ctx)
+
+	cancel()
+
+	hub.Close()
+
+	/*
+		11. Only now is it safe to destroy the SHM overlay.
 	*/
 	if err := shm.Close(); err != nil {
 		log.Printf(
-			"SHM shutdown: %v",
+			"SHM close: %v",
 			err,
 		)
 	}
+}
+
+func osSyncBacking(
+	writer *Writer,
+) error {
+	if writer == nil ||
+		writer.disk == nil {
+		return nil
+	}
+
+	return writer.disk.Sync()
 }
