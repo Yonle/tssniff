@@ -88,7 +88,6 @@ func (s *TSScanner) Feed(
 
 	if s.detected {
 		if off == s.expected {
-			// Normal continuation of the current physical TS range.
 			s.buffer = append(
 				s.buffer,
 				data...,
@@ -102,23 +101,17 @@ func (s *TSScanner) Feed(
 		}
 
 		/*
-			A non-contiguous write may be:
-			- unrelated NTFS metadata
-			- another part of the fragmented TS file
+			This write is physically non-contiguous.
 
-			Do not destroy the current stream just because
-			the physical address changed.
-
-			Probe this write independently.
+			It may be unrelated metadata or another fragmented TS
+			extent. Probe it independently.
 		*/
 		idx, ok := findMPEGTS(data)
 
 		if !ok {
-			// Probably metadata / unrelated disk activity.
-			return nil, true
+			return nil, false
 		}
 
-		// We found another genuine MPEG-TS segment.
 		s.buffer = append(
 			s.buffer[:0],
 			data[idx:]...,
@@ -141,7 +134,6 @@ func (s *TSScanner) Feed(
 
 		return s.emit(), true
 	}
-
 	/*
 		Not detected yet:
 		a non-contiguous write starts a new candidate.

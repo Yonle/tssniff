@@ -26,7 +26,7 @@ const (
 type writerCommand struct {
 	kind writerCommandKind
 
-	write   WriteEvent
+	write   ObservedWrite
 	barrier chan error
 }
 
@@ -104,7 +104,7 @@ func (w *Writer) PunchInput() chan<- PunchRequest {
 }
 
 func (w *Writer) SubmitWrite(
-	ev WriteEvent,
+	ev ObservedWrite,
 ) {
 	w.in <- writerCommand{
 		kind:  writerWrite,
@@ -261,47 +261,65 @@ func (w *Writer) processCommand(
 }
 
 func (w *Writer) processWrite(
-	ev WriteEvent,
+	ev ObservedWrite,
 ) {
+	write := ev.Event
+
 	end :=
-		ev.Offset +
-			uint64(len(ev.Data))
+		write.Offset +
+			uint64(len(write.Data))
 
-	/*
-		Record the write before touching the disk.
+	if ev.MPEGTS {
+		/*
+			The sniffer has already processed this write.
 
-		This protects later punch operations against newer writes
-		which have already entered the physical writer.
-	*/
+			The STB never reads MPEG-TS payload back, so there is
+			no reason to materialize it in the sparse backing image.
+		*/
+		if err := w.shm.ReleaseIfCurrent(
+			[]ShmExtent{
+				write.Staged,
+			},
+		); err != nil {
+			log.Printf(
+				"SHM release TS seq=%d: %v",
+				write.Seq,
+				err,
+			)
+		}
+
+		return
+	}
+
 	w.rememberWrite(
-		ev.Seq,
-		ev.Offset,
+		write.Seq,
+		write.Offset,
 		end,
 	)
 
 	n, err := w.disk.WriteAt(
-		ev.Data,
-		int64(ev.Offset),
+		write.Data,
+		int64(write.Offset),
 	)
 	if err != nil {
 		log.Printf(
 			"physical write failed seq=%d off=%d len=%d: %v",
-			ev.Seq,
-			ev.Offset,
-			len(ev.Data),
+			write.Seq,
+			write.Offset,
+			len(write.Data),
 			err,
 		)
 
 		return
 	}
 
-	if n != len(ev.Data) {
+	if n != len(write.Data) {
 		log.Printf(
 			"short physical write seq=%d off=%d n=%d want=%d",
-			ev.Seq,
-			ev.Offset,
+			write.Seq,
+			write.Offset,
 			n,
-			len(ev.Data),
+			len(write.Data),
 		)
 
 		return
@@ -309,12 +327,12 @@ func (w *Writer) processWrite(
 
 	if err := w.shm.ReleaseIfCurrent(
 		[]ShmExtent{
-			ev.Staged,
+			write.Staged,
 		},
 	); err != nil {
 		log.Printf(
 			"SHM release seq=%d: %v",
-			ev.Seq,
+			write.Seq,
 			err,
 		)
 	}

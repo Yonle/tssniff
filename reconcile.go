@@ -101,6 +101,7 @@ func (r *Reconciler) run() {
 	defer r.wg.Done()
 
 	for ev := range r.in {
+		write := ev.Event
 		/*
 			Remember every MPEG-TS capture.
 
@@ -112,11 +113,10 @@ func (r *Reconciler) run() {
 		*/
 		for _, capture := range ev.Captures {
 			r.captures.Add(capture)
-
 			r.reconcileCapture(capture)
 		}
 
-		if !ev.TouchesMFT {
+		if !write.TouchesMFT {
 			continue
 		}
 
@@ -131,8 +131,9 @@ func (r *Reconciler) run() {
 			to be matched against historical captures.
 		*/
 		newRanges := r.ntfs.ObserveMFTWrite(
-			ev.Offset,
-			ev.End,
+			write.Offset,
+			write.Offset+
+				uint64(len(write.Data)),
 		)
 
 		for _, dataRange := range newRanges {

@@ -25,6 +25,8 @@ type WritePipeline struct {
 
 	barriers chan barrierRequest
 
+	observed chan ObservedWrite
+
 	writer  *Writer
 	sniffer *Sniffer
 
@@ -58,6 +60,11 @@ func NewWritePipeline(
 			pipelineBarrierDepth,
 		),
 
+		observed: make(
+			chan ObservedWrite,
+			pipelineWriteDepth,
+		),
+
 		writer: writer,
 
 		sniffer: sniffer,
@@ -75,6 +82,10 @@ func (p *WritePipeline) Start() {
 
 	go p.run()
 	go p.runPunches()
+}
+
+func (p *WritePipeline) Observed() <-chan ObservedWrite {
+	return p.observed
 }
 
 func (p *WritePipeline) SubmitWrite(
@@ -198,7 +209,6 @@ func (p *WritePipeline) run() {
 		Therefore they observe exactly the same sequence.
 	*/
 	dispatchWrite := func(ev WriteEvent) {
-		p.writer.SubmitWrite(ev)
 		p.sniffer.Input() <- ev
 
 		dispatchedSeq = ev.Seq
@@ -288,6 +298,21 @@ func (p *WritePipeline) run() {
 			}
 
 			acceptWrite(ev)
+
+		case ev, ok := <-p.sniffer.Output():
+			if !ok {
+				/*
+					The sniffer has finished processing all dispatched
+					writes.
+				*/
+				return
+			}
+
+			p.writer.SubmitWrite(ev)
+
+			p.observed <- ev
+
+			dispatchedSeq = ev.Event.Seq
 
 		case req := <-p.barriers:
 

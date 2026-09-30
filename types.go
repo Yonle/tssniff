@@ -32,12 +32,9 @@ type WriteEvent struct {
 }
 
 type ObservedWrite struct {
-	Seq uint64
+	Event WriteEvent
 
-	Offset uint64
-	End    uint64
-
-	TouchesMFT bool
+	MPEGTS bool
 
 	Captures []CaptureRange
 }
