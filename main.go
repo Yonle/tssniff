@@ -160,7 +160,7 @@ func main() {
 	)
 
 	reconciler := NewReconciler(
-		sniffer.Output(),
+		pipeline.Observed(),
 		ntfs,
 		pipeline,
 	)

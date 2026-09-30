@@ -282,18 +282,6 @@ func (g *USBGadget) Teardown() {
 		return
 	}
 
-	udcFile := filepath.Join(
-		gadgetPath,
-		"UDC",
-	)
-
-	if _, err := os.Stat(udcFile); err == nil {
-		g.writeFile(
-			udcFile,
-			"",
-		)
-	}
-
 	_ = os.Remove(
 		filepath.Join(
 			gadgetPath,
